@@ -450,6 +450,7 @@ impl SessionState {
     pub fn set_root_key(&mut self, root_key: &RootKey) {
         if let Some(existing) = self.session.root_key.as_mut()
             && existing.len() == root_key.key().len()
+            && existing.capacity() == root_key.key().len()
         {
             existing.copy_from_slice(root_key.key());
         } else {
@@ -1830,11 +1831,14 @@ mod tests {
 
     #[test]
     fn root_key_update_reuses_storage_and_preserves_snapshot() {
+        let mut oversized = Vec::with_capacity(128);
+        oversized.resize(32, 0x11);
         for previous in [
             None,
             Some(Vec::new()),
             Some(vec![0x11; 31]),
             Some(vec![0x11; 32]),
+            Some(oversized),
         ] {
             let mut state = SessionState::from_session_structure(SessionStructure {
                 root_key: previous.clone(),
@@ -1844,11 +1848,12 @@ mod tests {
                 .session
                 .root_key
                 .as_ref()
-                .filter(|key| key.len() == 32)
+                .filter(|key| key.len() == 32 && key.capacity() == 32)
                 .map(Vec::as_ptr);
             let snapshot = state.decrypt_snapshot();
             state.set_root_key(&RootKey::new([0x22; 32]));
             assert_eq!(state.root_key().unwrap().key(), &[0x22; 32]);
+            assert_eq!(state.session.root_key.as_ref().unwrap().capacity(), 32);
             if let Some(ptr) = ptr {
                 assert_eq!(state.session.root_key.as_ref().unwrap().as_ptr(), ptr);
             }

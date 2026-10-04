@@ -1045,14 +1045,19 @@ impl SenderKeyRecord {
         let incarnation_len = incarnation
             .map(|_| super::local_field::STORE_INCARNATION_ENCODED_LEN)
             .unwrap_or(0);
-        let states_len = self
-            .states
-            .iter()
-            .map(|state| record_encoding::nested_len(state.encoded_len()))
-            .sum::<usize>();
+        // Construction and deserialization cap the history at this limit.
+        // Retain lengths on the stack so sizing never rescans a backlog during
+        // the write pass or adds a heap allocation per flush.
+        let mut state_lengths = [0; consts::MAX_SENDER_KEY_STATES];
+        let mut states_len = 0;
+        for (index, state) in self.states.iter().enumerate() {
+            let len = state.encoded_len();
+            state_lengths[index] = len;
+            states_len += record_encoding::nested_len(len);
+        }
         let mut buf = Vec::with_capacity(states_len + reservation_len + incarnation_len);
-        for state in &self.states {
-            record_encoding::write_nested(1, state.encoded_len(), &mut buf);
+        for (index, state) in self.states.iter().enumerate() {
+            record_encoding::write_nested(1, state_lengths[index], &mut buf);
             state.encode_into(&mut buf);
         }
         // Append the local-only reservation as a top-level field the generated
@@ -1868,7 +1873,9 @@ mod tests {
                         let mut record = SenderKeyRecord::new_empty();
                         // Exercise multiple states and a shared backlog without
                         // mutating either state during serialization.
-                        record.states.extend([state.clone(), state]);
+                        record
+                            .states
+                            .extend(std::iter::repeat_n(state, consts::MAX_SENDER_KEY_STATES));
                         let expected = record.as_protobuf().encode_to_vec();
                         assert_eq!(record.serialize().expect("serialize"), expected);
                         assert_eq!(
