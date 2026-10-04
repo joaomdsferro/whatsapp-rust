@@ -3493,22 +3493,7 @@ impl ProtocolStore for SqliteStore {
             Box::new(move |conn: &mut SqliteConnection| {
                 conn.transaction::<_, DieselError, _>(|conn| {
                     for entry in entries.iter() {
-                        diesel::insert_into(lid_pn_mapping::table)
-                            .values((
-                                lid_pn_mapping::lid.eq(&entry.lid),
-                                lid_pn_mapping::phone_number.eq(&entry.phone_number),
-                                lid_pn_mapping::created_at.eq(entry.created_at),
-                                lid_pn_mapping::learning_source.eq(&entry.learning_source),
-                                lid_pn_mapping::updated_at.eq(entry.updated_at),
-                                lid_pn_mapping::device_id.eq(device_id),
-                            ))
-                            .on_conflict((lid_pn_mapping::lid, lid_pn_mapping::device_id))
-                            .do_update()
-                            .set((
-                                lid_pn_mapping::phone_number.eq(&entry.phone_number),
-                                lid_pn_mapping::learning_source.eq(&entry.learning_source),
-                                lid_pn_mapping::updated_at.eq(entry.updated_at),
-                            ))
+                        crate::upsert_queries::UpsertLidPnMapping { entry, device_id }
                             .execute(conn)?;
                     }
                     Ok(())

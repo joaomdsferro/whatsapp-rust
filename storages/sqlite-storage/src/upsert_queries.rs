@@ -1,7 +1,7 @@
 use diesel::query_builder::{AstPass, QueryFragment, QueryId};
 use diesel::query_dsl::RunQueryDsl;
 use diesel::result::QueryResult;
-use diesel::sql_types::{Binary, Integer, Nullable, Text};
+use diesel::sql_types::{BigInt, Binary, Integer, Nullable, Text};
 use diesel::sqlite::Sqlite;
 
 /// Static query identifier for `UpsertSession`.
@@ -190,6 +190,54 @@ impl<'a> QueryFragment<Sqlite> for UpsertDeviceRegistry<'a> {
     }
 }
 
+/// Fixed identity for the six-parameter LID mapping statement.
+#[derive(Debug, Clone, Copy)]
+pub struct UpsertLidPnMappingQuery;
+
+impl QueryId for UpsertLidPnMappingQuery {
+    type QueryId = Self;
+    const HAS_STATIC_QUERY_ID: bool = true;
+}
+
+/// Reuses one statement per connection. Only the mutable mapping fields are
+/// replaced on conflict; `created_at` remains the first insertion's timestamp.
+#[derive(Debug)]
+pub struct UpsertLidPnMapping<'a> {
+    pub entry: &'a wacore::store::traits::LidPnMappingEntry,
+    pub device_id: i32,
+}
+
+impl QueryId for UpsertLidPnMapping<'_> {
+    type QueryId = UpsertLidPnMappingQuery;
+    const HAS_STATIC_QUERY_ID: bool = true;
+}
+
+impl<Conn> RunQueryDsl<Conn> for UpsertLidPnMapping<'_> {}
+
+impl QueryFragment<Sqlite> for UpsertLidPnMapping<'_> {
+    fn walk_ast<'b>(&'b self, mut out: AstPass<'_, 'b, Sqlite>) -> QueryResult<()> {
+        out.push_sql("INSERT INTO \"lid_pn_mapping\" (\"lid\", \"phone_number\", \"created_at\", \"learning_source\", \"updated_at\", \"device_id\") VALUES (");
+        out.push_bind_param::<Text, _>(&self.entry.lid)?;
+        out.push_sql(", ");
+        out.push_bind_param::<Text, _>(&self.entry.phone_number)?;
+        out.push_sql(", ");
+        out.push_bind_param::<BigInt, _>(&self.entry.created_at)?;
+        out.push_sql(", ");
+        out.push_bind_param::<Text, _>(&self.entry.learning_source)?;
+        out.push_sql(", ");
+        out.push_bind_param::<BigInt, _>(&self.entry.updated_at)?;
+        out.push_sql(", ");
+        out.push_bind_param::<Integer, _>(&self.device_id)?;
+        out.push_sql(
+            ") ON CONFLICT (\"lid\", \"device_id\") DO UPDATE SET \
+             \"phone_number\" = excluded.\"phone_number\", \
+             \"learning_source\" = excluded.\"learning_source\", \
+             \"updated_at\" = excluded.\"updated_at\"",
+        );
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,6 +364,11 @@ mod tests {
         let id_identity = TypeId::of::<<UpsertIdentity as QueryId>::QueryId>();
         let id_sender_key = TypeId::of::<<UpsertSenderKey as QueryId>::QueryId>();
         let id_registry = TypeId::of::<<UpsertDeviceRegistry as QueryId>::QueryId>();
+        let id_lid = TypeId::of::<<UpsertLidPnMapping as QueryId>::QueryId>();
+        for other in [id_session, id_identity, id_sender_key, id_registry] {
+            assert_ne!(id_lid, other);
+        }
+        const { assert!(<UpsertLidPnMapping as QueryId>::HAS_STATIC_QUERY_ID) };
 
         assert_ne!(id_session, id_identity);
         assert_ne!(id_session, id_sender_key);
@@ -375,7 +428,7 @@ mod tests {
 
         // Verify data
         use diesel::dsl::sql;
-        let count: i64 = diesel::select(sql::<diesel::sql_types::BigInt>("count(*) FROM sessions"))
+        let count: i64 = diesel::select(sql::<BigInt>("count(*) FROM sessions"))
             .get_result(&mut conn)
             .expect("count");
         assert_eq!(count, 2);
@@ -510,11 +563,9 @@ mod tests {
         assert!(result.is_err());
 
         // Verify user2 was NOT committed
-        let count: i64 = diesel::select(diesel::dsl::sql::<diesel::sql_types::BigInt>(
-            "count(*) FROM sessions",
-        ))
-        .get_result(&mut conn)
-        .expect("count");
+        let count: i64 = diesel::select(diesel::dsl::sql::<BigInt>("count(*) FROM sessions"))
+            .get_result(&mut conn)
+            .expect("count");
         assert_eq!(count, 1);
 
         // Connection statement cache is still healthy and prepared statement can be reused immediately
@@ -549,7 +600,8 @@ mod tests {
                 "CREATE TABLE sessions (address TEXT, record BLOB CHECK(length(record) > 0), device_id INTEGER, PRIMARY KEY(address, device_id));
                  CREATE TABLE identities (address TEXT, key BLOB, device_id INTEGER, PRIMARY KEY(address, device_id));
                  CREATE TABLE sender_keys (address TEXT, record BLOB, device_id INTEGER, PRIMARY KEY(address, device_id));
-                 CREATE TABLE device_registry (user_id TEXT, devices_json TEXT, timestamp INTEGER, phash TEXT, device_id INTEGER, updated_at INTEGER, raw_id INTEGER, PRIMARY KEY(user_id, device_id));"
+                 CREATE TABLE device_registry (user_id TEXT, devices_json TEXT, timestamp INTEGER, phash TEXT, device_id INTEGER, updated_at INTEGER, raw_id INTEGER, PRIMARY KEY(user_id, device_id));
+                 CREATE TABLE lid_pn_mapping (lid TEXT, phone_number TEXT CHECK(length(phone_number) > 0), created_at BIGINT, learning_source TEXT, updated_at BIGINT, device_id INTEGER, PRIMARY KEY(lid, device_id));"
             ).unwrap();
             let cached = Arc::new(Mutex::new(Vec::<String>::new()));
             let events = Arc::clone(&cached);
@@ -561,6 +613,19 @@ mod tests {
 
             for turn in 0..4 {
                 for device_id in 0..2 {
+                    let entry = wacore::store::traits::LidPnMappingEntry {
+                        lid: "100000000000011".into(),
+                        phone_number: format!("1555000000{turn}"),
+                        created_at: i64::from(turn),
+                        learning_source: "usync".into(),
+                        updated_at: i64::from(turn),
+                    };
+                    UpsertLidPnMapping {
+                        entry: &entry,
+                        device_id,
+                    }
+                    .execute(&mut conn)
+                    .unwrap();
                     UpsertSession {
                         address: "fictional",
                         record: &[turn + 1],
@@ -595,13 +660,41 @@ mod tests {
                     .unwrap();
                 }
             }
+            let mut entry = wacore::store::traits::LidPnMappingEntry {
+                lid: "100000000000011".into(),
+                phone_number: String::new(),
+                created_at: 9,
+                updated_at: 9,
+                learning_source: "other".into(),
+            };
+            assert!(
+                UpsertLidPnMapping {
+                    entry: &entry,
+                    device_id: 0
+                }
+                .execute(&mut conn)
+                .is_err()
+            );
+            entry.phone_number = "15550000009".into();
+            UpsertLidPnMapping {
+                entry: &entry,
+                device_id: 0,
+            }
+            .execute(&mut conn)
+            .unwrap();
             let queries = cached.lock().unwrap().clone();
             assert_eq!(
                 queries.len(),
-                4,
+                5,
                 "exactly one cache insertion per query shape"
             );
-            for table in ["sessions", "identities", "sender_keys", "device_registry"] {
+            for table in [
+                "sessions",
+                "identities",
+                "sender_keys",
+                "device_registry",
+                "lid_pn_mapping",
+            ] {
                 assert_eq!(
                     queries
                         .iter()
@@ -639,7 +732,7 @@ mod tests {
             .unwrap();
             assert_eq!(
                 cached.lock().unwrap().len(),
-                4,
+                5,
                 "failed execution must not evict/reprepare the statement"
             );
 
