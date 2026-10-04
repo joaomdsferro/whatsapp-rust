@@ -485,13 +485,13 @@
           "removed-video-state"
         ],
         "lib": true,
-        "expected_failure": {
-          "code": "E0599",
+        "expect_failure": {
           "contains": [
             "VideoStateChanged",
             "CallEvent"
           ],
-          "source": "src/peer_video/negative.rs"
+          "source": "src/peer_video/negative.rs",
+          "error_code": "E0599"
         }
       }
     ]
