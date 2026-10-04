@@ -2,7 +2,7 @@ name: CodSpeed
 
 on:
   push:
-    branches: [main]
+    branches: [perf/arena-walltime-head]
     paths-ignore: ["**.md", "docs/**"]
   pull_request:
     branches: [main]

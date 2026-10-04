@@ -1,0 +1,42 @@
+name: Drain arena walltime validation
+on:
+  push:
+    branches: [perf/arena-walltime-base, perf/arena-walltime-head]
+permissions:
+  contents: read
+  id-token: write
+concurrency:
+  group: arena-walltime-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  CARGO_TERM_COLOR: never
+  MALLOC_ARENA_MAX: "1"
+  MALLOC_MMAP_THRESHOLD_: "131072"
+  MALLOC_TRIM_THRESHOLD_: "131072"
+  MALLOC_TOP_PAD_: "131072"
+jobs:
+  walltime:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
+        with:
+          toolchain: nightly-2026-06-16
+      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0
+        with:
+          tool: protoc@3.25.3,cargo-codspeed@5.0.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          prefix-key: arena-walltime-arm
+          cache-targets: "false"
+      - name: Build receive and connected benchmarks
+        run: cargo codspeed build -m walltime -p whatsapp-rust --features bench-harness --bench client_receive --bench connected_idle
+      - name: Measure receive and connected walltime
+        uses: CodSpeedHQ/action@c4fd08a3a159bd0cc208da1e0edf32b8c47d75e5
+        with:
+          mode: walltime
+          runner-version: 5.4.0
+          run: cargo codspeed run -p whatsapp-rust --bench client_receive --bench connected_idle 'worker_|activity_peak|cache_maintenance_after_activity' -- --sample-count 1000 --sample-size 1
