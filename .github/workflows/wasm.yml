@@ -63,7 +63,7 @@ jobs:
           cargo build -p whatsapp-rust --lib --release
           --target wasm32-unknown-unknown
           --no-default-features
-      - name: Build/check registered standalone API hosts for wasm32
+      - name: Check isolated standalone API profiles for wasm32
         env:
           CARGO_BUILD_JOBS: "1"
         run: cargo xt ci consumers run --lane wasm --toolchain nightly-2026-06-16

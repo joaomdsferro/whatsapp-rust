@@ -39,3 +39,9 @@ tools outside `default-members`.
 Metadata commands write only machine-readable results to stdout. Timed tests
 require `NEXTEST_PROFILE` and `TEST_TIMINGS_DIR`. GitHub workflow tasks use the
 same scoped environment inputs as their previous inline implementations.
+
+`cargo xt ci consumers run --lane native` runs the standalone public API profiles
+in `tests/api-consumer`; `--lane msrv --toolchain 1.94.1` and `--lane wasm`
+select the other gates. The single lock is mandatory. Directed negatives share
+one validator for error code, message and primary source. There is no staging
+exemption for missing fixtures. Add new contracts to an existing domain module.

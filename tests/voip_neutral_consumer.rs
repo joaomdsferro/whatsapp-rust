@@ -2,7 +2,7 @@
 //! Separate no-default/WASM package checks still verify isolation from feature unification.
 #![cfg(feature = "voip-control")]
 
-#[path = "fixtures/voip_control_consumer/src/lib.rs"]
+#[path = "api-consumer/src/voip_control/mod.rs"]
 mod consumer;
 
 use whatsapp_rust::voip_control::{CallDirection, MediaEvent, MediaSessionKey, VoipMediaBackend};

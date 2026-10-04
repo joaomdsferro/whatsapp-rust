@@ -53,9 +53,9 @@ jobs:
       # the registry, so no additional lane-independent check step is necessary.
       - name: Build driver
         run: cargo +nightly-2026-06-16 build --locked -p whatsapp-xtask
-      - name: Run native hosts and rustdoc negative controls
+      - name: Run isolated native profiles and shared negative controls
         if: matrix.lane == 'native'
         run: target/debug/whatsapp-xtask ci consumers run --lane native --toolchain nightly-2026-06-16
-      - name: Run hosts at the published MSRV and rustdoc negative controls
+      - name: Run isolated profiles at the published MSRV
         if: matrix.lane == 'msrv'
         run: target/debug/whatsapp-xtask ci consumers run --lane msrv --toolchain 1.94.1

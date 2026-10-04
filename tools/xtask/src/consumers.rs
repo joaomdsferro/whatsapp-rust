@@ -61,10 +61,6 @@ struct Consumer {
     // Legacy fixtures without a committed lock resolve independently; never use
     // the root lock or add them to its workspace to make --locked work.
     locked: bool,
-    /// Temporary forward registration for a separately owned, unmerged domain PR.
-    /// Missing fixtures are reported, never executed or claimed covered.
-    #[serde(default)]
-    integration_pr: Option<String>,
     commands: Vec<Invocation>,
 }
 #[derive(Debug, Deserialize)]
@@ -91,6 +87,8 @@ struct Invocation {
 struct ExpectedFailure {
     error_code: String,
     contains: Vec<String>,
+    #[serde(default)]
+    source: Option<String>,
 }
 impl ExpectedFailure {
     fn verify(&self, success: bool, stdout: &str) -> Result<()> {
@@ -124,6 +122,20 @@ impl ExpectedFailure {
                 text.contains(needle),
                 "negative control's {} diagnostic did not report {needle:?}",
                 self.error_code
+            );
+        }
+        if let Some(source) = &self.source {
+            let spans = diagnostic["spans"]
+                .as_array()
+                .context("compiler source spans")?;
+            ensure!(
+                spans.iter().any(|span| {
+                    span["is_primary"] == true
+                        && span["file_name"]
+                            .as_str()
+                            .is_some_and(|name| Path::new(name).ends_with(source))
+                }),
+                "negative control must fail at {source}"
             );
         }
         Ok(())
@@ -179,39 +191,22 @@ fn validate(root: &Path, consumers: &[Consumer]) -> Result<()> {
             "duplicate consumer: {}",
             consumer.manifest
         );
-        if let Some(pr) = &consumer.integration_pr {
-            let number = pr
-                .strip_prefix("https://github.com/oxidezap/whatsapp-rust/pull/")
-                .context("integration_pr must name this repository's PR")?;
-            ensure!(
-                !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()),
-                "invalid integration_pr: {pr}"
-            );
-        }
-        if root.join(path).is_file() {
-            ensure!(
-                consumer.integration_pr.is_none(),
-                "{} has arrived: remove integration_pr to promote mandatory coverage before validation",
-                consumer.manifest
-            );
-            let text = std::fs::read_to_string(root.join(path))?;
-            ensure!(
-                text.lines().any(|line| line.trim() == "[workspace]"),
-                "{} must remain a standalone workspace",
-                consumer.manifest
-            );
-            ensure!(
-                !consumer.locked || root.join(path).with_file_name("Cargo.lock").is_file(),
-                "{} requires a committed Cargo.lock",
-                consumer.manifest
-            );
-        } else {
-            ensure!(
-                consumer.integration_pr.is_some(),
-                "registered consumer missing: {}",
-                consumer.manifest
-            );
-        }
+        ensure!(
+            root.join(path).is_file(),
+            "registered consumer missing: {}",
+            consumer.manifest
+        );
+        let text = std::fs::read_to_string(root.join(path))?;
+        ensure!(
+            text.lines().any(|line| line.trim() == "[workspace]"),
+            "{} must remain a standalone workspace",
+            consumer.manifest
+        );
+        ensure!(
+            !consumer.locked || root.join(path).with_file_name("Cargo.lock").is_file(),
+            "{} requires a committed Cargo.lock",
+            consumer.manifest
+        );
         ensure!(
             !consumer.commands.is_empty(),
             "{} has no commands",
@@ -294,16 +289,7 @@ fn validate(root: &Path, consumers: &[Consumer]) -> Result<()> {
         );
     }
     let unregistered = found.difference(&registered).cloned().collect::<Vec<_>>();
-    let staged = consumers
-        .iter()
-        .filter(|c| c.integration_pr.is_some())
-        .map(|c| c.manifest.clone())
-        .collect::<BTreeSet<_>>();
-    let stale = registered
-        .difference(&found)
-        .filter(|path| !staged.contains(*path))
-        .cloned()
-        .collect::<Vec<_>>();
+    let stale = registered.difference(&found).cloned().collect::<Vec<_>>();
     ensure!(
         unregistered.is_empty() && stale.is_empty(),
         "consumer registry drift; unregistered: {unregistered:?}; stale: {stale:?}. Register each tests/ Cargo.toml and meaningful modes in {REGISTRY}"
@@ -346,18 +332,6 @@ impl Invocation {
 pub fn run(root: &Path, task: Task) -> Result<u8> {
     let consumers: Vec<Consumer> = serde_json::from_slice(&std::fs::read(root.join(REGISTRY))?)?;
     validate(root, &consumers)?;
-    let present = consumers
-        .iter()
-        .filter(|c| root.join(&c.manifest).is_file())
-        .count();
-    for consumer in &consumers {
-        if let Some(pr) = &consumer.integration_pr {
-            println!(
-                "NOT YET INTEGRATED: {} ({pr}); no commands executed or coverage claimed",
-                consumer.manifest
-            );
-        }
-    }
     let Task::Run {
         lane,
         toolchain,
@@ -367,7 +341,7 @@ pub fn run(root: &Path, task: Task) -> Result<u8> {
     else {
         println!(
             "Consumer registry covers all {} standalone tests/ manifests.",
-            present
+            consumers.len()
         );
         return Ok(0);
     };
@@ -384,9 +358,6 @@ pub fn run(root: &Path, task: Task) -> Result<u8> {
     let mut count = 0;
     let mut first_failure = 0;
     for consumer in &consumers {
-        if !root.join(&consumer.manifest).is_file() {
-            continue;
-        }
         if manifest.as_ref().is_some_and(|m| m != &consumer.manifest) {
             continue;
         }
@@ -547,6 +518,7 @@ mod tests {
         let expected = ExpectedFailure {
             error_code: "E0599".into(),
             contains: vec!["VideoStateChanged".into(), "CallEvent".into()],
+            source: None,
         };
         let diagnostic = |code: &str, message: &str| {
             serde_json::json!({"reason":"compiler-message","message":{"level":"error","code":{"code":code},"message":message}}).to_string()
@@ -576,6 +548,7 @@ mod tests {
         let typed = ExpectedFailure {
             error_code: "E0308".into(),
             contains: vec!["expected `MessageId`".into(), "found `String`".into()],
+            source: None,
         };
         let typed_output = serde_json::json!({"reason":"compiler-message","message":{"level":"error","code":{"code":"E0308"},"message":"mismatched types","rendered":"error[E0308]: mismatched types\nexpected `MessageId`, found `String`"}}).to_string();
         assert!(typed.verify(false, &typed_output).is_ok());
@@ -589,23 +562,36 @@ mod tests {
         );
     }
     #[test]
-    fn forward_registration_is_explicit_and_checks_every_mode_when_fixture_arrives() {
-        let (root, mut consumers) = fixture();
-        let incoming: Consumer = serde_json::from_str(r#"{"manifest":"tests/fixtures/incoming/Cargo.toml","locked":true,"integration_pr":"https://github.com/oxidezap/whatsapp-rust/pull/1624","commands":[{"lanes":["native","msrv"],"mode":"test"},{"lanes":["wasm"],"mode":"check"}]}"#).unwrap();
-        consumers.push(incoming);
-        validate(root.path(), &consumers).unwrap();
-        let path = root.path().join(&consumers[1].manifest);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, "[workspace]").unwrap();
-        assert!(validate(root.path(), &consumers).is_err()); // Its lock is now mandatory.
-        std::fs::write(path.with_file_name("Cargo.lock"), "").unwrap();
-        let error = validate(root.path(), &consumers).unwrap_err().to_string();
-        assert!(error.contains("remove integration_pr")); // Cannot leave an integrated exemption.
-        consumers[1].integration_pr = None; // Promotion is mandatory, not a documentation-only convention.
-        validate(root.path(), &consumers).unwrap();
-        std::fs::remove_file(path).unwrap();
-        assert!(validate(root.path(), &consumers).is_err());
+    fn negative_controls_require_the_primary_source_when_specified() {
+        let expected = ExpectedFailure {
+            error_code: "E0639".into(),
+            contains: vec!["ImageOptions".into()],
+            source: Some("src/media_cache/negative.rs".into()),
+        };
+        let diagnostic = |file: &str, primary: bool| {
+            serde_json::json!({"reason":"compiler-message","message":{
+                "level":"error","code":{"code":"E0639"},"message":"ImageOptions",
+                "spans":[{"file_name":file,"is_primary":primary}]
+            }})
+            .to_string()
+        };
+        assert!(
+            expected
+                .verify(false, &diagnostic("src/media_cache/negative.rs", true))
+                .is_ok()
+        );
+        assert!(
+            expected
+                .verify(false, &diagnostic("src/unrelated.rs", true))
+                .is_err()
+        );
+        assert!(
+            expected
+                .verify(false, &diagnostic("src/media_cache/negative.rs", false))
+                .is_err()
+        );
     }
+
     #[test]
     fn refuses_silent_native_or_msrv_coverage_gaps() {
         let (root, mut consumers) = fixture();
