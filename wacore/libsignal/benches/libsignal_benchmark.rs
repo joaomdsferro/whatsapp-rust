@@ -919,18 +919,17 @@ fn setup_sender_key_record(backlog: usize) -> SenderKeyRecord {
         .add_sender_key_state(
             3,
             7,
-            backlog as u32,
+            0,
             &[0x11; 32],
             pair.public_key,
             Some(pair.private_key),
         )
         .expect("sender state");
     let state = record.sender_key_state_mut().expect("sender state");
-    for iteration in 0..backlog {
-        state.add_sender_message_key(&wacore_libsignal::protocol::SenderMessageKey::new(
-            iteration as u32,
-            [iteration as u8; 32],
-        ));
+    for _ in 0..backlog {
+        let chain = state.sender_chain_key().expect("chain");
+        state.add_sender_message_key(&chain.sender_message_key());
+        state.set_sender_chain_key(chain.next().expect("next chain"));
     }
     record
 }
