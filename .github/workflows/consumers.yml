@@ -56,6 +56,6 @@ jobs:
       - name: Run isolated native profiles and shared negative controls
         if: matrix.lane == 'native'
         run: target/debug/whatsapp-xtask ci consumers run --lane native --toolchain nightly-2026-06-16
-      - name: Run isolated profiles at the published MSRV
+      - name: Run isolated MSRV profiles and shared negative controls
         if: matrix.lane == 'msrv'
         run: target/debug/whatsapp-xtask ci consumers run --lane msrv --toolchain 1.94.1

@@ -12,8 +12,8 @@ not a new crate. `tools/xtask/consumers.json` defines the executed profiles.
 - `native` runs construction, event delivery, downloads and lifecycle outcomes.
 - `plugins`, `voip-control`, `voip-runtime` and `voip-mlow` check those independent
   opt-ins. The SDK's native runtime adapter and SQLite stay disabled until selected.
-- `sqlite` tests native store construction; `sqlite` checks browser futures
-  with the storage crate's `wasm-test` feature. `sdk,requests` checks request
+- The `sqlite` profile tests native store construction and links browser futures
+  in the `wasm` lane with the storage crate's `wasm-test` feature. `sdk,requests` checks request
   branches separately from default requests.
 
 Directed negatives run through xtask's shared diagnostic validator. It checks

@@ -30,7 +30,7 @@ pub mod voip_control;
 #[cfg(feature = "sdk")]
 pub mod groups_lookup;
 
-#[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+#[cfg(feature = "sdk")]
 pub mod lifecycle;
 
 #[cfg(feature = "core")]

@@ -13,3 +13,9 @@
 //! ```compile_fail,E0603
 //! use whatsapp_rust::features::community::Community;
 //! ```
+//!
+//! Call actions expose their wire tag, not an additional action-kind accessor.
+//! ```compile_fail,E0599
+//! use whatsapp_rust::wacore::types::call::CallAction;
+//! fn unsupported(action: &CallAction) { let _ = action.action_kind(); }
+//! ```
