@@ -1840,8 +1840,9 @@ mod tests {
             Some(vec![0x11; 32]),
             Some(oversized),
         ] {
+            let expected = previous.clone();
             let mut state = SessionState::from_session_structure(SessionStructure {
-                root_key: previous.clone(),
+                root_key: previous,
                 ..Default::default()
             });
             let ptr = state
@@ -1858,7 +1859,7 @@ mod tests {
                 assert_eq!(state.session.root_key.as_ref().unwrap().as_ptr(), ptr);
             }
             state.restore_decrypt_snapshot(snapshot);
-            assert_eq!(state.session.root_key, previous);
+            assert_eq!(state.session.root_key, expected);
         }
     }
 
