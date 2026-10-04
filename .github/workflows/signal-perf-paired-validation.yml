@@ -1,0 +1,65 @@
+name: Signal paired walltime validation
+
+on:
+  push:
+    branches: [perf/signal-allocation-paired-validation]
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: signal-paired-validation
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_TARGET_DIR: ${{ runner.temp }}/signal-paired-target
+  MALLOC_ARENA_MAX: "1"
+  MALLOC_MMAP_THRESHOLD_: "131072"
+  MALLOC_TRIM_THRESHOLD_: "131072"
+  MALLOC_TOP_PAD_: "131072"
+
+jobs:
+  paired:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out baseline runtime with matching fixtures
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: db626c60e5ad7d57fa4848bbef894913c8bbed18
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
+        with:
+          toolchain: nightly-2026-06-16
+      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0
+        with:
+          tool: cargo-codspeed@5.0.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          prefix-key: signal-paired-walltime
+          cache-targets: "false"
+      - name: Build baseline
+        run: cargo codspeed build -m walltime -p wacore-libsignal --bench libsignal_benchmark
+      - name: Measure baseline on this runner
+        id: baseline
+        uses: CodSpeedHQ/action@c4fd08a3a159bd0cc208da1e0edf32b8c47d75e5
+        with:
+          mode: walltime
+          runner-version: 5.4.0
+          run: cargo codspeed run -p wacore-libsignal --bench libsignal_benchmark 'bench_(dm_|group_(encrypt|decrypt)|sender_key_(serialize|export)|session_(serialize|with_self|root_key)|full_dm)'
+      - name: Check out unchanged PR head on the same runner
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 8f6d80237afe235b7ddb7989fa2c47e73ac816cb
+          persist-credentials: false
+      - name: Build PR head
+        run: cargo codspeed build -m walltime -p wacore-libsignal --bench libsignal_benchmark
+      - name: Measure PR head on this runner
+        id: head
+        uses: CodSpeedHQ/action@c4fd08a3a159bd0cc208da1e0edf32b8c47d75e5
+        with:
+          mode: walltime
+          runner-version: 5.4.0
+          run: cargo codspeed run -p wacore-libsignal --bench libsignal_benchmark 'bench_(dm_|group_(encrypt|decrypt)|sender_key_(serialize|export)|session_(serialize|with_self|root_key)|full_dm)'
