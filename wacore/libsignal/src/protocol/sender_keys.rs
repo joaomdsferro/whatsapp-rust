@@ -16,9 +16,9 @@ use crate::protocol::record_components::{
     SenderKeyRecordComponents, sender_state_components_from_structure,
     sender_state_structure_from_components,
 };
-use crate::protocol::stores::{
-    SenderKeyRecordStructure, SenderKeyStateStructure, sender_key_state_structure,
-};
+#[cfg(test)]
+use crate::protocol::stores::SenderKeyRecordStructure;
+use crate::protocol::stores::{SenderKeyStateStructure, sender_key_state_structure};
 use crate::protocol::{PrivateKey, PublicKey, SignalProtocolError, consts};
 use subtle::ConstantTimeEq;
 
@@ -561,6 +561,7 @@ impl SenderKeyState {
         self.signing_key_memo.get().is_some()
     }
 
+    #[cfg(test)]
     pub(crate) fn as_protobuf(&self) -> SenderKeyStateStructure {
         SenderKeyStateStructure {
             sender_key_id: self.sender_key_id,
@@ -574,8 +575,6 @@ impl SenderKeyState {
     }
 
     fn into_protobuf(self) -> SenderKeyStateStructure {
-        let message_keys = std::sync::Arc::try_unwrap(self.message_keys)
-            .unwrap_or_else(|shared| shared.as_ref().clone());
         SenderKeyStateStructure {
             sender_key_id: self.sender_key_id,
             sender_chain_key: self
@@ -585,7 +584,57 @@ impl SenderKeyState {
                     MessageField::some(chain.as_protobuf())
                 }),
             sender_signing_key: self.sender_signing_key,
-            sender_message_keys: StoredMessageKey::as_protobuf_list(&message_keys),
+            sender_message_keys: StoredMessageKey::as_protobuf_list(&self.message_keys),
+        }
+    }
+
+    fn encoded_len(&self) -> usize {
+        use record_encoding::{bytes_len, nested_len, seed_record_len, uint32_len};
+
+        self.sender_key_id.map_or(0, uint32_len)
+            + self
+                .sender_chain
+                .as_ref()
+                .map_or(0, |chain| nested_len(seed_record_len(chain.iteration)))
+            + self.sender_signing_key.as_option().map_or(0, |key| {
+                nested_len(
+                    key.public.as_deref().map_or(0, bytes_len)
+                        + key.private.as_deref().map_or(0, bytes_len),
+                )
+            })
+            + self
+                .message_keys
+                .iter()
+                .map(|key| nested_len(seed_record_len(key.iteration)))
+                .sum::<usize>()
+    }
+
+    fn encode_into(&self, out: &mut Vec<u8>) {
+        use record_encoding::{
+            bytes_len, write_bytes, write_nested, write_seed_record, write_uint32,
+        };
+
+        if let Some(id) = self.sender_key_id {
+            write_uint32(1, id, out);
+        }
+        if let Some(chain) = &self.sender_chain {
+            write_nested(2, record_encoding::seed_record_len(chain.iteration), out);
+            write_seed_record(chain.iteration, &chain.chain_key, out);
+        }
+        if let Some(key) = self.sender_signing_key.as_option() {
+            let len = key.public.as_deref().map_or(0, bytes_len)
+                + key.private.as_deref().map_or(0, bytes_len);
+            write_nested(3, len, out);
+            if let Some(public) = key.public.as_deref() {
+                write_bytes(1, public, out);
+            }
+            if let Some(private) = key.private.as_deref() {
+                write_bytes(2, private, out);
+            }
+        }
+        for key in self.message_keys.iter() {
+            write_nested(4, record_encoding::seed_record_len(key.iteration), out);
+            write_seed_record(key.iteration, &key.seed, out);
         }
     }
 
@@ -642,6 +691,51 @@ pub struct SenderKeyRecord {
 /// decoder skips this unknown top-level field and `deserialize` scans it out.
 /// Matches the field-number scheme `SessionRecord` uses for its DM counterpart.
 const RESERVED_ITERATION_FIELD: u32 = super::local_field::COUNTER_RESERVATION_FIELD;
+
+// SenderKeyRecordStructure/StateStructure's field numbers and ordering come
+// from whatsapp.proto. Write the typed seeds directly into the final buffer
+// instead of copying them into Bytes and a temporary protobuf per skipped key.
+// Differential tests below hold this writer to the generated encoder, including
+// present zero/empty fields. All these schema tags fit in one byte.
+mod record_encoding {
+    use buffa::encoding::{Tag, WireType, encode_varint, varint_len};
+
+    pub(super) fn uint32_len(value: u32) -> usize {
+        1 + varint_len(u64::from(value))
+    }
+
+    pub(super) fn nested_len(len: usize) -> usize {
+        1 + varint_len(len as u64) + len
+    }
+
+    pub(super) fn bytes_len(bytes: &[u8]) -> usize {
+        nested_len(bytes.len())
+    }
+
+    pub(super) fn seed_record_len(iteration: u32) -> usize {
+        uint32_len(iteration) + nested_len(32)
+    }
+
+    pub(super) fn write_uint32(field: u32, value: u32, out: &mut Vec<u8>) {
+        Tag::new(field, WireType::Varint).encode(out);
+        encode_varint(u64::from(value), out);
+    }
+
+    pub(super) fn write_nested(field: u32, len: usize, out: &mut Vec<u8>) {
+        Tag::new(field, WireType::LengthDelimited).encode(out);
+        encode_varint(len as u64, out);
+    }
+
+    pub(super) fn write_bytes(field: u32, bytes: &[u8], out: &mut Vec<u8>) {
+        write_nested(field, bytes.len(), out);
+        out.extend_from_slice(bytes);
+    }
+
+    pub(super) fn write_seed_record(iteration: u32, seed: &[u8; 32], out: &mut Vec<u8>) {
+        write_uint32(1, iteration, out);
+        write_bytes(2, seed, out);
+    }
+}
 
 impl SenderKeyRecord {
     pub fn new_empty() -> Self {
@@ -910,6 +1004,7 @@ impl SenderKeyRecord {
         initial_length - self.states.len()
     }
 
+    #[cfg(test)]
     pub(crate) fn as_protobuf(&self) -> SenderKeyRecordStructure {
         let mut states = Vec::with_capacity(self.states.len());
         for state in &self.states {
@@ -940,7 +1035,6 @@ impl SenderKeyRecord {
     ) -> Result<Vec<u8>, SignalProtocolError> {
         use buffa::encoding::{Tag, WireType, encode_varint, varint_len};
 
-        let mut buf = waproto::codec::sender_key_record_to_vec(&self.as_protobuf());
         let reserved_iteration = self.lease.ceiling();
         let incarnation = incarnation.filter(|_| reserved_iteration > 0);
         let reservation_len = if reserved_iteration > 0 {
@@ -951,7 +1045,16 @@ impl SenderKeyRecord {
         let incarnation_len = incarnation
             .map(|_| super::local_field::STORE_INCARNATION_ENCODED_LEN)
             .unwrap_or(0);
-        buf.reserve(reservation_len + incarnation_len);
+        let states_len = self
+            .states
+            .iter()
+            .map(|state| record_encoding::nested_len(state.encoded_len()))
+            .sum::<usize>();
+        let mut buf = Vec::with_capacity(states_len + reservation_len + incarnation_len);
+        for state in &self.states {
+            record_encoding::write_nested(1, state.encoded_len(), &mut buf);
+            state.encode_into(&mut buf);
+        }
         // Append the local-only reservation as a top-level field the generated
         // decoder skips. Emitted only when non-zero, so legacy/unreserved records
         // stay byte-identical. Mirrors SessionRecord::serialize_into.
@@ -1718,6 +1821,97 @@ mod tests {
                 "id={id:?} chain={chain} signing={signing}"
             );
         }
+    }
+
+    #[test]
+    fn direct_record_encoding_matches_generated_encoder() {
+        use buffa::Message;
+        use bytes::Bytes;
+
+        let boundaries = [0, 1, 127, 128, 16_383, 16_384, 0x0fff_ffff, u32::MAX];
+        let signing_keys = [
+            MessageField::none(),
+            MessageField::some(sender_key_state_structure::SenderSigningKey::default()),
+            MessageField::some(sender_key_state_structure::SenderSigningKey {
+                public: Some(Bytes::new()),
+                private: Some(Bytes::new()),
+            }),
+            MessageField::some(sender_key_state_structure::SenderSigningKey {
+                public: Some(Bytes::from(vec![0x11; 33])),
+                private: Some(Bytes::from(vec![0x22; 32])),
+            }),
+            MessageField::some(sender_key_state_structure::SenderSigningKey {
+                public: Some(Bytes::from(vec![0x33; 128])),
+                private: None,
+            }),
+        ];
+        for id in std::iter::once(None).chain(boundaries.map(Some)) {
+            for signing in &signing_keys {
+                for chain in [None, Some(0), Some(u32::MAX)] {
+                    for count in [0, 1, 8, 256, consts::MAX_MESSAGE_KEYS] {
+                        let state = SenderKeyState::from_protobuf(SenderKeyStateStructure {
+                            sender_key_id: id,
+                            sender_chain_key: chain.map_or_else(MessageField::none, |iteration| {
+                                MessageField::some(sender_key_state_structure::SenderChainKey {
+                                    iteration: Some(iteration),
+                                    seed: Some(Bytes::from(vec![0x44; 32])),
+                                })
+                            }),
+                            sender_signing_key: signing.clone(),
+                            sender_message_keys: (0..count)
+                                .map(|i| sender_key_state_structure::SenderMessageKey {
+                                    iteration: Some(boundaries[i % boundaries.len()]),
+                                    seed: Some(Bytes::from(vec![0x55; 32])),
+                                })
+                                .collect(),
+                        });
+                        let mut record = SenderKeyRecord::new_empty();
+                        // Exercise multiple states and a shared backlog without
+                        // mutating either state during serialization.
+                        record.states.extend([state.clone(), state]);
+                        let expected = record.as_protobuf().encode_to_vec();
+                        assert_eq!(record.serialize().expect("serialize"), expected);
+                        assert_eq!(
+                            record
+                                .serialize_for_store(&[0x66; 16])
+                                .expect("serialize for store"),
+                            expected
+                        );
+                        assert_eq!(record.serialize().expect("serialize again"), expected);
+
+                        for ceiling in boundaries {
+                            record.lease = CounterLease::from_persisted_ceiling(ceiling);
+                            let mut expected = record.as_protobuf().encode_to_vec();
+                            if ceiling > 0 {
+                                use buffa::encoding::{Tag, WireType, encode_varint};
+                                Tag::new(RESERVED_ITERATION_FIELD, WireType::Varint)
+                                    .encode(&mut expected);
+                                encode_varint(u64::from(ceiling), &mut expected);
+                            }
+                            assert_eq!(record.serialize().expect("serialize lease"), expected);
+                            if ceiling > 0 {
+                                super::super::local_field::encode_store_incarnation(
+                                    &mut expected,
+                                    &[0x66; 16],
+                                );
+                            }
+                            assert_eq!(
+                                record
+                                    .serialize_for_store(&[0x66; 16])
+                                    .expect("serialize lease for store"),
+                                expected
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            SenderKeyRecord::new_empty()
+                .serialize()
+                .expect("serialize empty record"),
+            Vec::<u8>::new()
+        );
     }
 
     /// Cloning a state is a refcount bump; a later mutation must copy-on-write so

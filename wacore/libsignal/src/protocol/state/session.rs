@@ -420,9 +420,11 @@ impl SessionState {
     }
 
     pub fn session_with_self(&self) -> Result<bool, InvalidSessionError> {
-        if let Some(remote_id) = self.remote_identity_key_bytes()? {
-            let local_id = self.local_identity_key_bytes()?;
-            return Ok(remote_id == local_id);
+        if let Some(remote_id) = self.remote_identity_key()? {
+            let local_id = self.local_identity_key()?;
+            // Compare canonical encodings on the stack: stored keys may carry
+            // trailing bytes that the decoder intentionally ignores.
+            return Ok(remote_id.serialize() == local_id.serialize());
         }
 
         // If remote ID is not set then we can't be sure but treat as non-self
@@ -446,7 +448,13 @@ impl SessionState {
     }
 
     pub fn set_root_key(&mut self, root_key: &RootKey) {
-        self.session.root_key = Some(root_key.key().to_vec());
+        if let Some(existing) = self.session.root_key.as_mut()
+            && existing.len() == root_key.key().len()
+        {
+            existing.copy_from_slice(root_key.key());
+        } else {
+            self.session.root_key = Some(root_key.key().to_vec());
+        }
     }
 
     pub fn sender_ratchet_key(&self) -> Result<PublicKey, InvalidSessionError> {
@@ -1776,6 +1784,77 @@ mod tests {
 
     fn rng() -> impl rand::CryptoRng {
         rand::make_rng::<rand::rngs::StdRng>()
+    }
+
+    #[test]
+    fn self_session_comparison_preserves_decoding_and_error_order() {
+        let mut key = vec![0x11; 33];
+        key[0] = 5;
+        let mut other = key.clone();
+        other[1] = 0x22;
+        let mut trailing = key.clone();
+        trailing.extend_from_slice(&[0x33; 7]);
+        let invalid = vec![4; 33];
+        for (remote, local, expected) in [
+            (None, Some(invalid.clone()), Ok(false)),
+            (Some(Vec::new()), None, Ok(false)),
+            (Some(key.clone()), Some(key.clone()), Ok(true)),
+            (Some(key.clone()), Some(other), Ok(false)),
+            (Some(trailing.clone()), Some(key.clone()), Ok(true)),
+            (Some(key.clone()), Some(trailing), Ok(true)),
+            (
+                Some(invalid.clone()),
+                Some(invalid.clone()),
+                Err("invalid remote identity key"),
+            ),
+            (
+                Some(vec![5]),
+                Some(key.clone()),
+                Err("invalid remote identity key"),
+            ),
+            (
+                Some(key.clone()),
+                Some(invalid),
+                Err("invalid local identity key"),
+            ),
+            (Some(key), None, Err("invalid local identity key")),
+        ] {
+            let state = SessionState::from_session_structure(SessionStructure {
+                remote_identity_public: remote,
+                local_identity_public: local,
+                ..Default::default()
+            });
+            assert_eq!(state.session_with_self().map_err(|err| err.0), expected,);
+        }
+    }
+
+    #[test]
+    fn root_key_update_reuses_storage_and_preserves_snapshot() {
+        for previous in [
+            None,
+            Some(Vec::new()),
+            Some(vec![0x11; 31]),
+            Some(vec![0x11; 32]),
+        ] {
+            let mut state = SessionState::from_session_structure(SessionStructure {
+                root_key: previous.clone(),
+                ..Default::default()
+            });
+            let ptr = state
+                .session
+                .root_key
+                .as_ref()
+                .filter(|key| key.len() == 32)
+                .map(Vec::as_ptr);
+            let snapshot = state.decrypt_snapshot();
+            state.set_root_key(&RootKey::new([0x22; 32]));
+            assert_eq!(state.root_key().unwrap().key(), &[0x22; 32]);
+            if let Some(ptr) = ptr {
+                assert_eq!(state.session.root_key.as_ref().unwrap().as_ptr(), ptr);
+            }
+            state.restore_decrypt_snapshot(snapshot);
+            assert_eq!(state.session.root_key, previous);
+        }
     }
 
     /// Creates a minimal valid SessionState for testing.
