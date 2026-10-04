@@ -164,3 +164,32 @@ async fn connected_control_stays_alive_without_activity() -> Result<()> {
     session.shutdown().await?;
     backend.cleanup()
 }
+
+#[tokio::test]
+async fn connected_history_identity_seed_is_durable_for_both_backends() -> Result<()> {
+    use whatsapp_rust::bench_support::connected_idle::HISTORY_IDENTITIES;
+    #[cfg(feature = "sqlite-storage")]
+    let backends = [BackendFixture::memory(), BackendFixture::sqlite().await?];
+    #[cfg(not(feature = "sqlite-storage"))]
+    let backends = [BackendFixture::memory()];
+    for backend in backends {
+        let session = Session::connect(backend.backend()).await?;
+        let activity = session.prepare_history_identity_activity().await?;
+        session.receive_activity(activity).await?;
+        let rows = backend.backend().get_all_lid_mappings().await?;
+        for i in 0..HISTORY_IDENTITIES {
+            let lid = format!("1000000001{i:05}");
+            let pn = format!("1555001{i:05}");
+            ensure!(
+                rows.iter().any(|row| row.lid == lid
+                    && row.phone_number == pn
+                    && row.learning_source == "other"),
+                "missing history pair {i}"
+            );
+        }
+        ensure!(session.checkpoint().await.connected);
+        session.shutdown().await?;
+        backend.cleanup()?;
+    }
+    Ok(())
+}

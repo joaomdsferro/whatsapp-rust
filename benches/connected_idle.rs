@@ -37,8 +37,7 @@ fn runtime() -> tokio::runtime::Runtime {
         .expect("fixture runtime")
 }
 
-#[divan::bench(args = [false, true], sample_count = 5, sample_size = 1)]
-fn activity_peak(bencher: divan::Bencher, sqlite: bool) {
+fn run_activity(bencher: divan::Bencher, sqlite: bool, identities: bool) {
     let rt = runtime();
     bencher
         .with_inputs(|| {
@@ -49,10 +48,12 @@ fn activity_peak(bencher: divan::Bencher, sqlite: bool) {
                     BackendFixture::memory()
                 };
                 let session = Session::connect(backend.backend()).await.expect("connect");
-                let activity = session
-                    .prepare_activity()
-                    .await
-                    .expect("prepare ciphertext/history");
+                let activity = if identities {
+                    session.prepare_history_identity_activity().await
+                } else {
+                    session.prepare_activity().await
+                }
+                .expect("prepare ciphertext/history");
                 Fixture {
                     rt: &rt,
                     session: Some(session),
@@ -72,6 +73,16 @@ fn activity_peak(bencher: divan::Bencher, sqlite: bool) {
             )
             .expect("all messages committed and dispatched");
         });
+}
+
+#[divan::bench(args = [false, true], sample_count = 5, sample_size = 1)]
+fn activity_peak(bencher: divan::Bencher, sqlite: bool) {
+    run_activity(bencher, sqlite, false);
+}
+
+#[divan::bench(args = [false, true], sample_count = 5, sample_size = 1)]
+fn history_identity_activity(bencher: divan::Bencher, sqlite: bool) {
+    run_activity(bencher, sqlite, true);
 }
 
 #[divan::bench(args = [false, true], sample_count = 5, sample_size = 1)]

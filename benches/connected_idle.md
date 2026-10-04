@@ -40,6 +40,25 @@ fresh file-backed `SqliteStore`, with its normal WAL/pool settings, never SQLite
 `:memory:`. Its files are private under `target/connected-idle/` and removed
 following shutdown.
 
+## History identity variant
+
+`history_identity_activity` adds 256 new fictitious PN/LID pairs in
+`HistorySync.phone_number_to_lid_mappings`, field 15. The original activity
+case stays mapping-free. Both backends run the same parser, cache learning,
+durable batch write and discovery migrations. A fixture runtime inherits a
+task-local completion channel through history's finite spawned descendants;
+the measured region waits for them and checks all persisted markers. Database
+readback is covered separately by the lifecycle test. No service response,
+flush gate or migration is replaced to shorten the workload.
+
+The field and learning path are verified in the pinned WhatsApp Web
+`2.3000.1045368834` bundle: `WAWebProtobufsHistorySync.pb` and
+`WAWebHandleHistorySyncChunk`. Web passes `history-sync-chunk` to
+`WAWebDBCreateLidPnMappings`, which selects its default new-LID policy.
+The fixture uses the existing Rust parser and `Other` policy unchanged.
+The count is a bounded scenario, not a claim about a production distribution.
+Compare this variant only against the identical fixture on the baseline.
+
 ## Fast CodSpeed/native Divan surfaces
 
 ```sh

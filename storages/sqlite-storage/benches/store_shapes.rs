@@ -340,6 +340,60 @@ fn lid_pn_put_batch(bencher: divan::Bencher, n: usize) {
         });
 }
 
+/// First LID write on a fresh connection. Setup/teardown are excluded so the
+/// Memory operation balance includes the statement retained by this write.
+#[divan::bench(args = N, sample_count = 20, sample_size = 1)]
+fn lid_pn_first_batch(bencher: divan::Bencher, n: usize) {
+    static NEXT: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
+    bencher
+        .with_inputs(|| {
+            let id = NEXT.fetch_add(1, portable_atomic::Ordering::Relaxed);
+            let db = Db::open(&format!("lid-first-{n}-{id}"));
+            let entries = (0..n).map(|_| lid_entry(db.id())).collect();
+            FirstLidBatch {
+                db: Some(db),
+                entries,
+                written: false,
+            }
+        })
+        .bench_local_refs(|input| {
+            let db = input.db.as_ref().expect("live database");
+            db.runtime
+                .block_on(db.store.put_lid_mappings(black_box(&input.entries)))
+                .expect("first LID batch");
+            input.written = true;
+        });
+}
+
+struct FirstLidBatch {
+    db: Option<Db>,
+    entries: Vec<LidPnMappingEntry>,
+    written: bool,
+}
+
+impl Drop for FirstLidBatch {
+    fn drop(&mut self) {
+        let Some(db) = self.db.take() else { return };
+        if self.written && !std::thread::panicking() {
+            let rows = db
+                .runtime
+                .block_on(db.store.get_all_lid_mappings())
+                .expect("verify rows");
+            assert_eq!(rows.len(), self.entries.len());
+            for entry in &self.entries {
+                assert!(rows.iter().any(|row| row.lid == entry.lid
+                    && row.phone_number == entry.phone_number
+                    && row.created_at == entry.created_at
+                    && row.updated_at == entry.updated_at
+                    && row.learning_source == entry.learning_source));
+            }
+        }
+        let path = db.path.clone();
+        drop(db);
+        remove_db_files(&path);
+    }
+}
+
 // ---------- sender key devices ----------
 
 const BENCH_GROUP: &str = "120363000000000001@g.us";

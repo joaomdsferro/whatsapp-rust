@@ -11,6 +11,7 @@ use std::io::Write;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use wacore::runtime::{AbortHandle, BoxFuture, Runtime};
 
 use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
@@ -115,6 +116,7 @@ pub const LANES: usize = 32;
 pub const MESSAGES: usize = 256;
 pub const TEXT_BYTES: usize = 4096;
 pub const HISTORY_MESSAGES: usize = 256;
+pub const HISTORY_IDENTITIES: usize = 256;
 /// Fixture-only sender-key/signature randomness, never for a shipping client.
 pub const WORKLOAD_SEED: u64 = 0x434f_4e4e_4543_5431;
 const DEADLINE: Duration = Duration::from_secs(30);
@@ -152,10 +154,54 @@ impl InboundDurabilityHook for Commit {
     }
 }
 
+// A task-local sender is inherited only by history's finite descendants. Closing
+// the channel joins them without polling SQLite or counting unrelated keepalives.
+tokio::task_local! {
+    static HISTORY_TASKS: tokio::sync::mpsc::UnboundedSender<()>;
+}
+
+struct HistoryRuntime;
+
+impl HistoryRuntime {
+    fn track(future: BoxFuture<'static, ()>) -> BoxFuture<'static, ()> {
+        match HISTORY_TASKS.try_with(Clone::clone) {
+            Ok(sender) => Box::pin(HISTORY_TASKS.scope(sender, future)),
+            Err(_) => future,
+        }
+    }
+}
+
+impl Runtime for HistoryRuntime {
+    fn spawn(&self, future: BoxFuture<'static, ()>) -> AbortHandle {
+        TokioRuntime.spawn(Self::track(future))
+    }
+
+    fn spawn_detached(&self, future: BoxFuture<'static, ()>) {
+        TokioRuntime.spawn_detached(Self::track(future));
+    }
+
+    fn sleep(&self, duration: Duration) -> BoxFuture<'static, ()> {
+        TokioRuntime.sleep(duration)
+    }
+
+    fn spawn_blocking(&self, f: Box<dyn FnOnce() + Send + 'static>) -> BoxFuture<'static, ()> {
+        TokioRuntime.spawn_blocking(f)
+    }
+
+    fn yield_now(&self) -> Option<BoxFuture<'static, ()>> {
+        TokioRuntime.yield_now()
+    }
+}
+
+fn history_identity(i: usize) -> (String, String) {
+    (format!("1000000001{i:05}"), format!("1555001{i:05}"))
+}
+
 /// Prepared ciphertext/history input, consumed by activity so it cannot contaminate idle samples.
 pub struct Activity {
     stanzas: Vec<Node>,
     history: wa::message::HistorySyncNotification,
+    identities: usize,
 }
 
 /// Only lifecycle observables, not a replacement for heap or process measurements.
@@ -209,7 +255,7 @@ impl Session {
         });
         let counts = Arc::new(Counts::default());
         let client = ClientBuilder::new()
-            .with_runtime(TokioRuntime)
+            .with_runtime(HistoryRuntime)
             .with_persistence_manager(pm)
             .with_transport_factory(Factory(wire.clone()))
             .with_http_client(NoHttp)
@@ -250,6 +296,16 @@ impl Session {
     /// Established Signal material and synthetic encryption are fixture setup, not
     /// part of the CodSpeed timed region. The peer is dropped before this returns.
     pub async fn prepare_activity(&self) -> Result<Activity> {
+        self.prepare_activity_inner(0).await
+    }
+
+    /// The same receive workload with 256 new identity pairs carried in history
+    /// field 15. Includes the production detached persistence/migration task.
+    pub async fn prepare_history_identity_activity(&self) -> Result<Activity> {
+        self.prepare_activity_inner(HISTORY_IDENTITIES).await
+    }
+
+    async fn prepare_activity_inner(&self, identities: usize) -> Result<Activity> {
         use wacore::libsignal::protocol::{create_sender_key_distribution_message, group_encrypt};
         super::seed_registry(&self.client, super::PEER_USER, &[0]).await;
         super::seed_registry(&self.client, super::OWN_USER, &[0, 1]).await;
@@ -313,6 +369,15 @@ impl Session {
         peer.flush_signal_cache().await?;
         self.client.flush_pending_signal_state().await?;
         let history = wa::HistorySync {
+            phone_number_to_lid_mappings: (0..identities)
+                .map(|i| {
+                    let (lid, pn) = history_identity(i);
+                    wa::PhoneNumberToLIDMapping {
+                        pn_jid: Some(format!("{pn}@s.whatsapp.net")),
+                        lid_jid: Some(format!("{lid}@lid")),
+                    }
+                })
+                .collect(),
             sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
             conversations: groups
                 .iter()
@@ -351,6 +416,7 @@ impl Session {
         let compressed = encoder.finish()?;
         Ok(Activity {
             stanzas,
+            identities,
             history: wa::message::HistorySyncNotification {
                 file_length: Some(compressed.len() as u64),
                 sync_type: Some(wa::message::HistorySyncType::INITIAL_BOOTSTRAP),
@@ -373,10 +439,28 @@ impl Session {
         let mut tracker = self
             .client
             .begin_history_sync_task(history.inline_payload.as_ref().map_or(0, Bytes::len));
-        self.client
-            .process_history_sync_task_tracked("IDLE-HISTORY".into(), history, &mut tracker)
+        let (sender, mut descendants) = tokio::sync::mpsc::unbounded_channel();
+        HISTORY_TASKS
+            .scope(
+                sender,
+                self.client.process_history_sync_task_tracked(
+                    "IDLE-HISTORY".into(),
+                    history,
+                    &mut tracker,
+                ),
+            )
             .await;
         drop(tracker);
+        tokio::time::timeout(DEADLINE, descendants.recv())
+            .await
+            .context("history descendants did not finish")?;
+        for i in 0..activity.identities {
+            let (lid, pn) = history_identity(i);
+            ensure!(
+                self.client.lid_pn_cache.is_persisted(&pn, &lid).await,
+                "history identity {i} was not durably persisted"
+            );
+        }
         self.finish_offline(MESSAGES).await?;
         self.wait_until(|| self.counts.messages.load(Ordering::Relaxed) == MESSAGES)
             .await?;

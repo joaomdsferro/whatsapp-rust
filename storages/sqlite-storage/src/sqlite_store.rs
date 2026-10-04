@@ -5704,6 +5704,124 @@ mod tests {
         );
     }
 
+    fn lid_row(lid: &str, phone: &str, created: i64, updated: i64) -> LidPnMappingEntry {
+        LidPnMappingEntry {
+            lid: lid.into(),
+            phone_number: phone.into(),
+            created_at: created,
+            updated_at: updated,
+            learning_source: "other".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn lid_batch_preserves_order_creation_time_and_device_scope() {
+        let db = create_test_store().await.database();
+        let first = db.create_device().await.unwrap();
+        let second = db.create_device().await.unwrap();
+        first
+            .put_lid_mapping(&lid_row("100000000000011", "15550000001", 10, 10))
+            .await
+            .unwrap();
+        second
+            .put_lid_mapping(&lid_row("100000000000011", "15550000002", 50, 50))
+            .await
+            .unwrap();
+        let mut last = lid_row("100000000000011", "15550000004", 99, 5);
+        last.learning_source = "usync".into();
+        first
+            .put_lid_mappings(&[
+                lid_row("100000000000011", "15550000003", 20, 20),
+                lid_row("100000000000012", "15550000005", 30, 30),
+                last,
+                lid_row("100000000000012", "15550000006", 40, 40),
+            ])
+            .await
+            .unwrap();
+        let row = first
+            .get_lid_mapping("100000000000011")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                row.phone_number.as_str(),
+                row.created_at,
+                row.updated_at,
+                row.learning_source.as_str()
+            ),
+            ("15550000004", 10, 5, "usync")
+        );
+        let row = first
+            .get_lid_mapping("100000000000012")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (row.phone_number.as_str(), row.created_at, row.updated_at),
+            ("15550000006", 30, 40)
+        );
+        let row = second
+            .get_lid_mapping("100000000000011")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (row.phone_number.as_str(), row.created_at, row.updated_at),
+            ("15550000002", 50, 50)
+        );
+        first.put_lid_mappings(&[]).await.unwrap();
+        assert_eq!(first.get_all_lid_mappings().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn lid_batch_late_failure_rolls_back_inserts_and_updates() {
+        use diesel::connection::SimpleConnection;
+        let store = create_test_store()
+            .await
+            .database()
+            .create_device()
+            .await
+            .unwrap();
+        store
+            .put_lid_mapping(&lid_row("100000000000011", "15550000001", 10, 10))
+            .await
+            .unwrap();
+        {
+            let mut conn = store.pool.get().unwrap();
+            conn.batch_execute(
+                "CREATE TRIGGER fail_lid_insert BEFORE INSERT ON lid_pn_mapping
+                WHEN NEW.lid = '100000000000013'
+                BEGIN SELECT RAISE(ABORT, 'injected batch failure'); END;",
+            )
+            .unwrap();
+        }
+        let batch = [
+            lid_row("100000000000011", "15550000002", 20, 20),
+            lid_row("100000000000012", "15550000003", 30, 30),
+            lid_row("100000000000013", "15550000004", 40, 40),
+        ];
+        assert!(store.put_lid_mappings(&batch).await.is_err());
+        let rows = store.get_all_lid_mappings().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            (
+                rows[0].phone_number.as_str(),
+                rows[0].created_at,
+                rows[0].updated_at
+            ),
+            ("15550000001", 10, 10)
+        );
+        store
+            .pool
+            .get()
+            .unwrap()
+            .batch_execute("DROP TRIGGER fail_lid_insert")
+            .unwrap();
+        store.put_lid_mappings(&batch).await.unwrap();
+        assert_eq!(store.get_all_lid_mappings().await.unwrap().len(), 3);
+    }
+
     #[tokio::test]
     async fn put_signal_batches_persist_and_upsert() {
         use std::sync::Arc;
