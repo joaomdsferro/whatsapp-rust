@@ -1938,7 +1938,9 @@ impl Client {
                 .peer_data_operation_request_response_message
                 .as_option()
         {
-            self.handle_pdo_response(pdo_response, info).await;
+            // PDO recovery holds a decoded WebMessageInfo across storage awaits.
+            // Allocate that rare future here so every chat lane need not carry it.
+            Box::pin(self.handle_pdo_response(pdo_response, info)).await;
         }
 
         // history_sync_notification is self-only (our phone drives history sync).

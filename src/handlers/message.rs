@@ -419,13 +419,10 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    #[ignore = "layout diagnostic: run explicitly with --ignored --nocapture"]
-    async fn audit_receive_future_and_struct_layouts() {
-        let sizes = Arc::new(std::sync::Mutex::new(Vec::new()));
+    async fn client_with_sizing_runtime(sizes: Arc<std::sync::Mutex<Vec<usize>>>) -> Arc<Client> {
         let sizing_runtime = SizingRuntime {
             inner: crate::runtime_impl::TokioRuntime,
-            sizes: Arc::clone(&sizes),
+            sizes,
         };
         let persistence_manager = Arc::new(
             crate::store::persistence_manager::PersistenceManager::new(
@@ -434,7 +431,7 @@ mod tests {
             .await
             .expect("persistence manager"),
         );
-        let client = Client::builder()
+        Client::builder()
             .with_runtime(sizing_runtime)
             .with_persistence_manager(persistence_manager)
             .with_transport_factory(crate::transport::mock::MockTransportFactory::new())
@@ -442,7 +439,41 @@ mod tests {
             .build()
             .await
             .expect("client build")
-            .into_client();
+            .into_client()
+    }
+
+    #[tokio::test]
+    #[cfg(target_pointer_width = "64")]
+    async fn chat_lane_future_stays_within_budget() {
+        let sizes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let client = client_with_sizing_runtime(Arc::clone(&sizes)).await;
+        let lane = create_chat_lane(
+            &client,
+            Arc::new(async_lock::Mutex::new(())),
+            Arc::new(async_lock::Mutex::new(())),
+        );
+        let task_size = sizes.lock().unwrap().pop().unwrap();
+        lane.queue_tx.close();
+
+        // Each active chat retains this allocation even while its worker waits.
+        // On the pinned nightly: 6504 bytes (8096 with tracing spans), versus
+        // 7568 (8432 with tracing) when PDO recovery was inline in every lane.
+        let budget = if cfg!(feature = "tracing") {
+            8 * 1024
+        } else {
+            7 * 1024
+        };
+        assert!(
+            task_size <= budget,
+            "chat lane future grew to {task_size} bytes; inspect the receive layout audit"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "layout diagnostic: run explicitly with --ignored --nocapture"]
+    async fn audit_receive_future_and_struct_layouts() {
+        let sizes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let client = client_with_sizing_runtime(Arc::clone(&sizes)).await;
 
         let dummy_chat: Jid = "120363000000000031@g.us".parse().unwrap();
         let dummy_node = message_for(&dummy_chat, "test_msg");
