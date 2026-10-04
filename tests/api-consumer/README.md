@@ -3,7 +3,7 @@
 One standalone manifest and lock verify downstream visibility without root
 workspace dev-dependencies. Run profiles separately with `cargo xt ci consumers
 run --lane native`; use `--lane msrv --toolchain 1.94.1` or `--lane wasm` for
-published MSRV and browser compilation. Add new contracts to the owning module,
+published MSRV and browser linking. Add new contracts to the owning module,
 not a new crate. `tools/xtask/consumers.json` defines the executed profiles.
 
 - `core` checks group inputs without the SDK or Tokio. `core,js` is its WASM graph.
@@ -25,5 +25,6 @@ client_options, events/event_kinds, lifecycle/lifecycle_graph, sqlite,
 creation/download/mex/pictures/requests, groups/groups_lookup,
 voip_control/peer_video and media_cache/actions/community/status. Root functional
 lookup tests stay in `tests/group_lookup_contract.rs`; call-action parser/wire
-checks stay in `wacore/tests/call_action_public.rs`. Historical alias names no
-longer need repeated negative proofs. Domain bins retain portable link probes.
+checks stay in `wacore/tests/call_action_public.rs`. Historical module aliases no
+longer need repeated negative proofs; the removed peer-video variant keeps one
+directed diagnostic control. Domain bins retain portable link probes.

@@ -25,6 +25,8 @@ requests = ["sdk"]
 js = ["wacore/js"]
 sqlite = ["sdk", "whatsapp-rust/sqlite-storage", "dep:whatsapp-rust-sqlite-storage", "dep:tokio"]
 
+removed-video-state = ["voip-control"]
+
 old-image-literal = ["sdk"]
 
 old-video-literal = ["sdk"]

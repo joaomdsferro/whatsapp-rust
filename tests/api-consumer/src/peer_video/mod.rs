@@ -21,7 +21,7 @@
 //! ```
 //!
 //! Stable rustdoc accepts any compilation failure, so also check the opt-in
-//! `removed-video-state` binary's diagnostic: it must report E0599 for the
+//! `removed-video-state` profile's diagnostic: it must report E0599 for the
 //! missing `VideoStateChanged` variant, not a feature/import/privacy error.
 
 use whatsapp_rust::Jid;
@@ -77,3 +77,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(feature = "removed-video-state")]
+mod negative;

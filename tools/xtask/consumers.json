@@ -55,9 +55,9 @@
         ],
         "mode": "test",
         "features": [
-          "voip-control"
-        ],
-        "lib": true
+          "voip-control",
+          "contracts"
+        ]
       },
       {
         "lanes": [
@@ -118,65 +118,72 @@
         "lanes": [
           "wasm"
         ],
-        "mode": "check",
+        "mode": "build",
         "features": [
           "sdk"
-        ]
+        ],
+        "release": true
       },
       {
         "lanes": [
           "wasm"
         ],
-        "mode": "check",
+        "mode": "build",
         "features": [
           "sdk",
           "requests"
-        ]
+        ],
+        "release": true
       },
       {
         "lanes": [
           "wasm"
         ],
-        "mode": "check",
+        "mode": "build",
         "features": [
           "plugins"
-        ]
+        ],
+        "release": true
       },
       {
         "lanes": [
           "wasm"
         ],
-        "mode": "check",
+        "mode": "build",
         "features": [
           "voip-control"
-        ]
+        ],
+        "release": true
       },
       {
         "lanes": [
           "wasm"
         ],
-        "mode": "check",
+        "mode": "build",
         "features": [
           "voip-runtime"
-        ]
+        ],
+        "release": true
       },
       {
         "lanes": [
           "wasm"
         ],
-        "mode": "check",
+        "mode": "build",
         "features": [
           "voip-mlow"
-        ]
+        ],
+        "release": true
       },
       {
         "lanes": [
           "wasm"
         ],
-        "mode": "check",
+        "mode": "build",
         "features": [
           "sqlite"
-        ]
+        ],
+        "release": true
       },
       {
         "lanes": [
@@ -466,6 +473,25 @@
             "StatusSendOptions"
           ],
           "source": "src/status/mod.rs"
+        }
+      },
+      {
+        "lanes": [
+          "native",
+          "msrv"
+        ],
+        "mode": "check",
+        "features": [
+          "removed-video-state"
+        ],
+        "lib": true,
+        "expected_failure": {
+          "code": "E0599",
+          "contains": [
+            "VideoStateChanged",
+            "CallEvent"
+          ],
+          "source": "src/peer_video/negative.rs"
         }
       }
     ]
