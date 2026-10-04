@@ -124,6 +124,48 @@ fn group_receive_burst(bencher: divan::Bencher) {
 
 const PLAINTEXT_CASES: &[&str] = &["text", "skdm_only", "suppressed", "malformed_secret"];
 
+/// Minimal PDO responses isolate the conditional allocation. They do not model
+/// successful placeholder recovery, Signal decryption, or a connected session.
+#[divan::bench(args = ["primary_empty", "secondary_empty", "other_account"], sample_count = 100, sample_size = 1)]
+fn pdo_response_allocation_control(bencher: divan::Bencher, case: &str) {
+    let harness = ReceiveHarness::new();
+    let mut message = wa::Message::default();
+    let protocol = message.protocol_message.get_or_insert_default();
+    protocol.r#type =
+        Some(wa::message::protocol_message::Type::PEER_DATA_OPERATION_REQUEST_RESPONSE_MESSAGE);
+    protocol
+        .peer_data_operation_request_response_message
+        .get_or_insert_default()
+        .stanza_id = Some("PDO-CONTROL".into());
+    let mut next_id = 0u64;
+    let mut make_input = || {
+        next_id += 1;
+        let sender = match case {
+            "primary_empty" => "19045550100@s.whatsapp.net",
+            "secondary_empty" => "19045550100:2@s.whatsapp.net",
+            "other_account" => "19045550190@s.whatsapp.net",
+            _ => unreachable!("fixed cases"),
+        };
+        (
+            wacore::messages::MessageUtils::encode_and_pad(&message),
+            Arc::new(MessageInfo {
+                id: format!("PDO-CONTROL-{next_id}").into(),
+                source: MessageSource {
+                    chat: "19045550100@s.whatsapp.net".parse().expect("own chat"),
+                    sender: sender.parse().expect("synthetic sender"),
+                    is_from_me: case != "other_account",
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+        )
+    };
+    assert_eq!(harness.plaintext_burst(vec![make_input()]), (1, 0));
+    bencher.with_inputs(make_input).bench_local_values(|input| {
+        assert_eq!(harness.plaintext_burst(vec![black_box(input)]), (1, 0));
+    });
+}
+
 /// Isolate decode/dispatch ownership costs from Signal. No DHAT allocator is
 /// installed here. Empty secret/SKDM carriers exercise allocation branches, not
 /// successful secret decryption or sender-key installation.

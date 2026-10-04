@@ -1,0 +1,52 @@
+name: PDO conditional allocation validation
+on:
+  push:
+    branches: [perf/pdo-cost-base, perf/pdo-cost-head]
+permissions:
+  contents: read
+  id-token: write
+concurrency:
+  group: pdo-cost-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  CARGO_TERM_COLOR: never
+  MALLOC_ARENA_MAX: "1"
+  MALLOC_MMAP_THRESHOLD_: "131072"
+  MALLOC_TRIM_THRESHOLD_: "131072"
+  MALLOC_TOP_PAD_: "131072"
+jobs:
+  conditional-cost:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-06-16
+      - name: Key the libc6-dbg cache on the installed libc6
+        id: libc6
+        run: cargo xt ci workflow libc-version
+      - uses: actions/cache@v6
+        with:
+          path: ~/.cache/libc6-dbg
+          key: libc6-dbg-${{ runner.arch }}-${{ steps.libc6.outputs.version }}
+      - name: Bound apt and pre-install libc6-dbg
+        env:
+          LIBC6_VERSION: ${{ steps.libc6.outputs.version }}
+        run: cargo xt ci workflow install-libc-debug
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: protoc@3.25.3,cargo-codspeed@5.0.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: pdo-cost
+          cache-targets: "false"
+      - name: Build conditional allocation controls
+        run: cargo codspeed build -m simulation -m memory -p whatsapp-rust --features bench-harness --bench client_receive
+      - name: Measure conditional allocation controls
+        uses: CodSpeedHQ/action@v5
+        with:
+          mode: simulation,memory
+          run: cargo codspeed run -p whatsapp-rust --bench client_receive pdo_response_allocation_control
