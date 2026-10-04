@@ -39,4 +39,4 @@ jobs:
         with:
           mode: walltime
           runner-version: 5.4.0
-          run: cargo codspeed run -p wacore-libsignal --bench libsignal_benchmark 'bench_dm_encrypt_first_message' -- --sample-count 1000 --sample-size 1
+          run: cargo codspeed run -p wacore-libsignal --bench libsignal_benchmark 'bench_(dm_|group_(encrypt|decrypt)|sender_key_(serialize|export)|session_(serialize|with_self|root_key)|full_dm)' -- --sample-count 1000 --sample-size 1
