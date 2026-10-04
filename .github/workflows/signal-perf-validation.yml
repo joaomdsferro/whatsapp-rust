@@ -1,0 +1,50 @@
+name: Signal allocation validation
+on:
+  push:
+    branches:
+      - perf/signal-allocation-reduction
+      - perf/signal-allocation-baseline
+permissions:
+  contents: read
+  id-token: write
+concurrency:
+  group: signal-allocation-validation-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  benchmark:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: cpu-memory
+            build_modes: -m simulation -m memory
+            run_modes: simulation,memory
+          - name: walltime
+            build_modes: -m walltime
+            run_modes: walltime
+    env:
+      CARGO_TERM_COLOR: never
+      MALLOC_ARENA_MAX: "1"
+      MALLOC_MMAP_THRESHOLD_: "131072"
+      MALLOC_TRIM_THRESHOLD_: "131072"
+      MALLOC_TOP_PAD_: "131072"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-06-16
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-codspeed@5.0.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: signal-allocation-${{ matrix.name }}
+          cache-targets: "false"
+      - name: Build matching benchmark suites
+        run: cargo codspeed build ${{ matrix.build_modes }} -p wacore-libsignal --bench libsignal_benchmark
+      - uses: CodSpeedHQ/action@v5
+        with:
+          mode: ${{ matrix.run_modes }}
+          run: cargo codspeed run -p wacore-libsignal --bench libsignal_benchmark 'bench_(dm_|group_(encrypt|decrypt)|sender_key_(serialize|export)|session_(serialize|with_self|root_key)|full_dm)'

@@ -889,6 +889,62 @@ fn bench_sender_key_serialize_with_backlog(bencher: divan::Bencher) {
         .bench_refs(|record| black_box(record.serialize().expect("serialize sender key")));
 }
 
+/// A components consumer may retain a cache clone while exporting its record.
+#[divan::bench]
+fn bench_sender_key_export_shared_backlog(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(|| {
+            let record = setup_sender_key_with_backlog();
+            (Some(record.clone()), record)
+        })
+        .bench_refs(|(record, retained)| {
+            black_box(&*retained);
+            black_box(
+                record
+                    .take()
+                    .expect("record")
+                    .into_components()
+                    .expect("components"),
+            );
+        });
+}
+
+#[divan::bench(args = [false, true])]
+fn bench_session_with_self(bencher: divan::Bencher, is_self: bool) {
+    bencher
+        .with_inputs(|| {
+            let mut rng = bench_rng();
+            let local = IdentityKey::new(KeyPair::generate(&mut rng).public_key);
+            let remote = if is_self {
+                local
+            } else {
+                IdentityKey::new(KeyPair::generate(&mut rng).public_key)
+            };
+            SessionState::new(
+                3,
+                &local,
+                &remote,
+                &RootKey::new([0x11; 32]),
+                local.public_key(),
+            )
+        })
+        .bench_refs(|state| black_box(state.session_with_self().expect("identities")));
+}
+
+#[divan::bench]
+fn bench_session_root_key_update(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(|| {
+            let mut rng = bench_rng();
+            let base = KeyPair::generate(&mut rng).public_key;
+            create_test_session_state(3, &base)
+        })
+        .bench_refs(|state| {
+            state.set_root_key(black_box(&RootKey::new([0x22; 32])));
+            black_box(&*state);
+        });
+}
+
 fn setup_conversation_data() -> (User, User) {
     setup_dm_users()
 }
