@@ -30,7 +30,7 @@ impl MsgSecretStore for ReadOnlyStore {
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-pub trait CreationOperations: Send + Sync {
+pub trait CreationOperations: whatsapp_rust::wacore::sync_marker::MaybeSendSync {
     async fn create_and_use(
         &self,
         chat: &Jid,
