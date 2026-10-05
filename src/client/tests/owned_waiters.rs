@@ -110,7 +110,10 @@ async fn active_incoming_waiter_survives_both_reconnect_modes() {
 }
 
 use crate::transport::mock::CapturingMockTransport;
-use crate::{MediaRetryResult, MediaReuploadError, MediaReuploadRequest, MessageId, MessageRef};
+use crate::{
+    MediaRetryResult, MediaReuploadError, MediaReuploadPhase, MediaReuploadRequest, MessageId,
+    MessageRef,
+};
 
 #[test]
 fn shared_reupload_errors_keep_the_original_typed_cause() {
@@ -306,7 +309,13 @@ async fn correlated_rejection_wins_over_early_notification_and_wrong_ack_is_igno
     let mut rejection = ack("NACK");
     rejection.attrs.insert("error", "479");
     deliver(&client, rejection);
-    assert!(matches!(future.await, Err(MediaReuploadError::Rejected(code)) if code == "479"));
+    assert!(matches!(
+        future.await,
+        Err(MediaReuploadError::Rejected {
+            code: Some(479),
+            ..
+        })
+    ));
     assert!(client.media_reuploads.lock().unwrap().is_empty());
     assert_eq!(counts(&client), (0, 0));
 }
@@ -327,9 +336,19 @@ async fn ack_and_notification_timeouts_release_operation_and_filters() {
         }
         let result = future.await;
         if with_ack {
-            assert!(matches!(result, Err(MediaReuploadError::Timeout)));
+            assert!(matches!(
+                result,
+                Err(MediaReuploadError::Timeout {
+                    phase: MediaReuploadPhase::Notification
+                })
+            ));
         } else {
-            assert!(matches!(result, Err(MediaReuploadError::AckTimeout)));
+            assert!(matches!(
+                result,
+                Err(MediaReuploadError::Timeout {
+                    phase: MediaReuploadPhase::SendAndAck
+                })
+            ));
         }
         assert!(client.media_reuploads.lock().unwrap().is_empty());
         assert_eq!(counts(&client), (0, 0));
@@ -643,6 +662,208 @@ async fn batch_duplicates_do_not_occupy_distinct_operation_slots() {
     }
     assert!(matches!(results[32], Ok(MediaRetryResult::DecryptionError)));
     assert_eq!(transport.sent().len(), 2);
+    assert_eq!(counts(&client), (0, 0));
+    assert!(client.media_reuploads.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn closed_reupload_channels_report_the_phase_to_all_subscribers() {
+    for with_ack in [false, true] {
+        let (client, _) = reupload_fixture().await;
+        let mut first = Box::pin(request(
+            client.clone(),
+            Jid::pn("15550000002"),
+            "CLOSED",
+            [1; 32],
+        ));
+        let mut second = Box::pin(request(
+            client.clone(),
+            Jid::pn("15550000002"),
+            "CLOSED",
+            [1; 32],
+        ));
+        assert!(futures::poll!(&mut first).is_pending());
+        assert!(futures::poll!(&mut second).is_pending());
+        if with_ack {
+            deliver(&client, ack("CLOSED"));
+        }
+        // Close the registered channels, keeping both subscriber futures alive.
+        // Like the sent-waiter teardown, adjust counts and wake outside the lock.
+        let removed = std::mem::take(&mut *client.node_waiters.lock().unwrap());
+        client
+            .node_waiter_count
+            .fetch_sub(removed.len(), Ordering::Release);
+        drop(removed);
+        let expected = if with_ack {
+            MediaReuploadPhase::Notification
+        } else {
+            MediaReuploadPhase::SendAndAck
+        };
+        for result in [first.await, second.await] {
+            assert!(
+                matches!(result, Err(MediaReuploadError::Cancelled { phase }) if phase == expected)
+            );
+        }
+        assert_eq!(counts(&client), (0, 0));
+        assert!(client.media_reuploads.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn reupload_send_is_part_of_the_first_timeout_budget() {
+    let (client, _) = reupload_fixture().await;
+    let stalled = Arc::new(crate::transport::mock::StallingMockTransport::new());
+    install_test_noise_socket(&client, stalled.clone(), client.runtime.clone()).await;
+    let started = tokio::time::Instant::now();
+    let mut future = Box::pin(request(
+        client.clone(),
+        Jid::pn("15550000002"),
+        "STALL",
+        [1; 32],
+    ));
+    assert!(futures::poll!(&mut future).is_pending());
+    // An early ACK and notification cannot turn a stalled send into success.
+    deliver(&client, ack("STALL"));
+    deliver(&client, notification("STALL"));
+    assert!(matches!(
+        future.await,
+        Err(MediaReuploadError::Timeout {
+            phase: MediaReuploadPhase::SendAndAck
+        })
+    ));
+    assert_eq!(stalled.sends_started(), 1);
+    assert_eq!(started.elapsed(), Duration::from_secs(30));
+    assert_eq!(counts(&client), (0, 0));
+    assert!(client.media_reuploads.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn reupload_rejections_preserve_the_full_shared_response_and_raw_code() {
+    for child_error in [false, true] {
+        for raw_code in [
+            Some("479"),
+            Some("599"),
+            Some("unknown-secret-code"),
+            Some("999999999999999999999"),
+            None,
+        ] {
+            if !child_error && raw_code.is_none() {
+                continue; // An absent attribute is not itself a rejection.
+            }
+            let (client, _) = reupload_fixture().await;
+            let mut first = Box::pin(request(
+                client.clone(),
+                Jid::pn("15550000002"),
+                "REJECT",
+                [1; 32],
+            ));
+            let mut second = Box::pin(request(
+                client.clone(),
+                Jid::pn("15550000002"),
+                "REJECT",
+                [1; 32],
+            ));
+            assert!(futures::poll!(&mut first).is_pending());
+            assert!(futures::poll!(&mut second).is_pending());
+            let mut node = ack("REJECT");
+            node.attrs.insert("diagnostic", "secret-payload-marker");
+            if child_error {
+                let mut error = NodeBuilder::new("error")
+                    .attr("text", "secret-child-marker")
+                    .build();
+                if let Some(code) = raw_code {
+                    error.attrs.insert("code", code);
+                }
+                node.content = Some(wacore_binary::NodeContent::Nodes(vec![error]));
+            } else {
+                node.attrs.insert("error", raw_code.unwrap());
+            }
+            let preserved = node_to_owned_ref(&node);
+            client.resolve_node_waiters(&preserved);
+            for result in [first.await, second.await] {
+                let error = result.unwrap_err();
+                let debug = format!("{error:?}");
+                for secret in [
+                    "secret-payload-marker",
+                    "secret-child-marker",
+                    "unknown-secret-code",
+                ] {
+                    assert!(!debug.contains(secret));
+                }
+                let MediaReuploadError::Rejected { code, response } = error else {
+                    panic!("expected rejection");
+                };
+                assert_eq!(code, raw_code.and_then(|raw| raw.parse().ok()));
+                assert!(Arc::ptr_eq(response.as_arc(), &preserved));
+                assert_eq!(
+                    response.get().get_attr("diagnostic").unwrap().as_str(),
+                    "secret-payload-marker"
+                );
+                let raw = if child_error {
+                    response
+                        .get()
+                        .get_optional_child_by_tag(&["error"])
+                        .unwrap()
+                        .get_attr("code")
+                        .map(|attr| attr.as_str().into_owned())
+                } else {
+                    response
+                        .get()
+                        .get_attr("error")
+                        .map(|attr| attr.as_str().into_owned())
+                };
+                assert_eq!(raw.as_deref(), raw_code);
+            }
+            assert_eq!(counts(&client), (0, 0));
+            assert!(client.media_reuploads.lock().unwrap().is_empty());
+        }
+    }
+}
+
+#[test]
+fn reupload_error_debug_hides_opaque_causes_without_losing_downcasts() {
+    use std::error::Error;
+    let marker = "signed-url-secret-marker";
+    let internal = MediaReuploadError::from(anyhow::Error::new(std::io::Error::other(marker)));
+    let client = MediaReuploadError::from(ClientError::Internal(anyhow::Error::new(
+        std::io::Error::other(marker),
+    )));
+    for error in [internal, client] {
+        assert!(!format!("{error:?}").contains(marker));
+        let source = error.source().unwrap();
+        let io = if let Some(client) = source.downcast_ref::<ClientError>() {
+            client
+                .source()
+                .unwrap()
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+        } else {
+            source.downcast_ref::<std::io::Error>().unwrap()
+        };
+        assert_eq!(io.to_string(), marker);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn reupload_notification_gets_a_fresh_budget_after_a_late_ack() {
+    let (client, _) = reupload_fixture().await;
+    let started = tokio::time::Instant::now();
+    let mut future = Box::pin(request(
+        client.clone(),
+        Jid::pn("15550000002"),
+        "LATE",
+        [1; 32],
+    ));
+    assert!(futures::poll!(&mut future).is_pending());
+    tokio::time::advance(Duration::from_secs(29)).await;
+    deliver(&client, ack("LATE"));
+    assert!(matches!(
+        future.await,
+        Err(MediaReuploadError::Timeout {
+            phase: MediaReuploadPhase::Notification
+        })
+    ));
+    assert_eq!(started.elapsed(), Duration::from_secs(59));
     assert_eq!(counts(&client), (0, 0));
     assert!(client.media_reuploads.lock().unwrap().is_empty());
 }
