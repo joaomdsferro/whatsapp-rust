@@ -326,8 +326,15 @@ impl<'a> MediaReupload<'a> {
                 }
             }
         }
+        async fn complete(
+            (operation, indices): (Shared<ReuploadFuture>, Vec<usize>),
+        ) -> (Result<MediaRetryResult, MediaReuploadError>, Vec<usize>) {
+            (operation.await, indices)
+        }
+        // Collect before awaiting: retaining the map in the stream prevents
+        // MSRV callers from proving this future is Send.
+        let operations: Vec<_> = operations.into_iter().map(complete).collect();
         let mut pending = futures::stream::iter(operations)
-            .map(|(operation, indices)| async move { (operation.await, indices) })
             .buffer_unordered(MEDIA_REUPLOAD_CONCURRENCY);
         while let Some((result, indices)) = pending.next().await {
             for index in indices {

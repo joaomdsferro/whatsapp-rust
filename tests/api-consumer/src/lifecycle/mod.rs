@@ -57,3 +57,13 @@ fn reupload_request_debug_redacts_the_media_key() {
     assert!(debug.contains("REDACTED"));
     assert!(!debug.contains("231"));
 }
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn sendable_batch_recovery<'a>(
+    client: &'a whatsapp_rust::Client,
+    requests: &'a [whatsapp_rust::MediaReuploadRequest<'a>],
+) -> impl std::future::Future<
+    Output = Vec<Result<whatsapp_rust::MediaRetryResult, whatsapp_rust::MediaReuploadError>>,
+> + Send + 'a {
+    async move { client.media_reupload().request_many(requests).await }
+}
