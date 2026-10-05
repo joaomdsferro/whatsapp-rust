@@ -966,27 +966,75 @@ fn session_state_batch(count: usize, is_self: bool) -> Vec<SessionState> {
         .collect()
 }
 
-#[divan::bench(args = [(false, 32), (true, 32)])]
-fn bench_session_with_self(bencher: divan::Bencher, (is_self, count): (bool, usize)) {
+// Keep one- and two-pass cases together while validating the candidate. The
+// second pass is a deliberate extra-work control, not a production workload.
+#[divan::bench(args = [(false, 1), (true, 1), (false, 2), (true, 2)])]
+fn bench_session_with_self_batch_32(bencher: divan::Bencher, (is_self, passes): (bool, usize)) {
     bencher
-        .with_inputs(|| session_state_batch(count, is_self))
+        .with_inputs(|| session_state_batch(32, is_self))
         .bench_refs(|states| {
-            for state in states.iter() {
-                black_box(black_box(state).session_with_self().expect("identities"));
+            for _ in 0..passes {
+                for state in states.iter() {
+                    black_box(black_box(state).session_with_self().expect("identities"));
+                }
             }
         });
 }
 
-#[divan::bench(args = [32])]
-fn bench_session_root_key_update(bencher: divan::Bencher, count: usize) {
+#[divan::bench(args = [1, 2])]
+fn bench_session_root_key_update_batch_32(bencher: divan::Bencher, passes: usize) {
     bencher
-        .with_inputs(|| session_state_batch(count, true))
+        .with_inputs(|| session_state_batch(32, true))
         .bench_refs(|states| {
-            let key = RootKey::new([0x22; 32]);
-            for state in states.iter_mut() {
-                black_box(&mut *state).set_root_key(black_box(&key));
-                black_box(&*state);
+            for pass in 0..passes {
+                let key = RootKey::new([0x22 + pass as u8; 32]);
+                for state in states.iter_mut() {
+                    black_box(&mut *state).set_root_key(black_box(&key));
+                    black_box(&*state);
+                }
             }
+        });
+}
+
+#[divan::bench(args = [false, true])]
+fn bench_session_with_self(bencher: divan::Bencher, is_self: bool) {
+    bencher
+        .with_inputs(|| {
+            let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(0x5345_4c46);
+            let local = IdentityKey::new(KeyPair::generate(&mut rng).public_key);
+            let remote = if is_self {
+                local
+            } else {
+                IdentityKey::new(KeyPair::generate(&mut rng).public_key)
+            };
+            SessionState::new(
+                3,
+                &local,
+                &remote,
+                &RootKey::new([0x11; 32]),
+                local.public_key(),
+            )
+        })
+        .bench_refs(|state| black_box(state.session_with_self().expect("identities")));
+}
+
+#[divan::bench]
+fn bench_session_root_key_update(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(|| {
+            let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(0x524f_4f54);
+            let local = IdentityKey::new(KeyPair::generate(&mut rng).public_key);
+            SessionState::new(
+                3,
+                &local,
+                &local,
+                &RootKey::new([0x11; 32]),
+                local.public_key(),
+            )
+        })
+        .bench_refs(|state| {
+            state.set_root_key(black_box(&RootKey::new([0x22; 32])));
+            black_box(&*state);
         });
 }
 
