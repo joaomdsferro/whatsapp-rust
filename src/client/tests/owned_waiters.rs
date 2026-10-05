@@ -557,3 +557,92 @@ async fn dropping_all_reupload_subscribers_does_not_cycle_the_client() {
     })
     .await;
 }
+
+#[tokio::test(start_paused = true)]
+async fn batch_starts_next_operation_while_first_is_pending() {
+    let (client, _) = reupload_fixture().await;
+    let chat = Jid::pn("15550000002");
+    let inputs: Vec<_> = (0..64)
+        .map(|index| MediaReuploadRequest {
+            target: MessageRef::new(
+                &chat,
+                MessageId::new(format!("BATCH-{index}")).unwrap(),
+                None,
+                false,
+            )
+            .unwrap(),
+            media_key: &[1; 32],
+        })
+        .collect();
+    let feature = client.media_reupload();
+    let mut batch = Box::pin(feature.request_many(&inputs));
+    let first_window = futures::future::join_all((0..32).map(|index| {
+        client.wait_for_sent_node(NodeFilter::tag("receipt").attr("id", format!("BATCH-{index}")))
+    }));
+    tokio::select! {
+        receipts = first_window => assert!(receipts.iter().all(Result::is_ok)),
+        result = &mut batch => panic!("batch completed before its receipts: {result:?}"),
+    }
+    assert_eq!(counts(&client).0, 64, "only 32 distinct operations start");
+    assert_eq!(
+        client.media_reuploads.lock().unwrap().len(),
+        64,
+        "all inputs are reserved"
+    );
+    for index in 1..32 {
+        deliver(&client, ack(&format!("BATCH-{index}")));
+        deliver(&client, notification(&format!("BATCH-{index}")));
+    }
+    let next = client.wait_for_sent_node(NodeFilter::tag("receipt").attr("id", "BATCH-32"));
+    tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::select! {
+            receipt = next => { receipt.unwrap(); },
+            result = &mut batch => panic!("first operation is still pending: {result:?}"),
+        }
+    })
+    .await
+    .expect("completed operations must release slots before the first completes");
+    drop(batch);
+    assert_eq!(counts(&client), (0, 0));
+    assert!(client.media_reuploads.lock().unwrap().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn batch_duplicates_do_not_occupy_distinct_operation_slots() {
+    let (client, transport) = reupload_fixture().await;
+    let chat = Jid::pn("15550000002");
+    let make = |id| MediaReuploadRequest {
+        target: MessageRef::new(&chat, MessageId::new(id).unwrap(), None, false).unwrap(),
+        media_key: &[1; 32],
+    };
+    let mut inputs = vec![make("A"); 32];
+    inputs.push(make("B"));
+    let feature = client.media_reupload();
+    let mut batch = Box::pin(feature.request_many(&inputs));
+    let b = client.wait_for_sent_node(NodeFilter::tag("receipt").attr("id", "B"));
+    tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::select! {
+            receipt = b => { receipt.unwrap(); },
+            result = &mut batch => panic!("A is still pending: {result:?}"),
+        }
+    })
+    .await
+    .expect("duplicate subscribers must not block B");
+    deliver(&client, ack("B"));
+    let mut b_result = notification("B");
+    b_result.content = Some(wacore_binary::NodeContent::Nodes(vec![
+        NodeBuilder::new("error").attr("code", "3").build(),
+    ]));
+    deliver(&client, b_result);
+    deliver(&client, ack("A"));
+    deliver(&client, notification("A"));
+    let results = batch.await;
+    assert_eq!(results.len(), 33);
+    for result in &results[..32] {
+        assert!(matches!(result, Ok(MediaRetryResult::NotFound)));
+    }
+    assert!(matches!(results[32], Ok(MediaRetryResult::DecryptionError)));
+    assert_eq!(transport.sent().len(), 2);
+    assert_eq!(counts(&client), (0, 0));
+    assert!(client.media_reuploads.lock().unwrap().is_empty());
+}

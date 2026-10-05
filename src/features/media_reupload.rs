@@ -296,20 +296,48 @@ impl<'a> MediaReupload<'a> {
     /// Recover a batch, preserving input order and cardinality. Identical inputs
     /// share one receipt even when separated by more than the concurrency window.
     /// The first occurrence reserves each wire ID; conflicting inputs receive
-    /// `Conflict` in their own result slot.
+    /// `Conflict` in their own result slot. Up to 32 distinct operations run at
+    /// once; duplicates share a slot and completed operations release it
+    /// without waiting for earlier inputs.
     pub async fn request_many(
         &self,
         reqs: &[MediaReuploadRequest<'_>],
     ) -> Vec<Result<MediaRetryResult, MediaReuploadError>> {
         use futures::StreamExt;
-        // Subscribe to all entries before polling any: duplicates beyond the
-        // concurrency window must share even if the first operation finishes.
-        let subscriptions: Vec<_> = reqs.iter().map(|req| self.subscribe(req)).collect();
-        futures::stream::iter(subscriptions)
-            .map(|subscription| async move { subscription?.await })
-            .buffered(MEDIA_REUPLOAD_CONCURRENCY)
+        let mut results = vec![None; reqs.len()];
+        let mut operations: Vec<(Shared<ReuploadFuture>, Vec<usize>)> = Vec::new();
+        let mut by_id = std::collections::HashMap::<&str, usize>::new();
+        // Reserve every input before polling: duplicates beyond the window
+        // must share even if the first operation finishes immediately.
+        for (index, req) in reqs.iter().enumerate() {
+            match self.subscribe(req) {
+                Err(error) => results[index] = Some(Err(error)),
+                Ok(subscription) => {
+                    if let Some(&operation) = by_id.get(req.target.id().as_str())
+                        && operations[operation].0.ptr_eq(&subscription)
+                    {
+                        operations[operation].1.push(index);
+                    } else {
+                        // An external subscriber can complete an operation
+                        // during reservation. Only group the same shared future.
+                        by_id.insert(req.target.id().as_str(), operations.len());
+                        operations.push((subscription, vec![index]));
+                    }
+                }
+            }
+        }
+        let mut pending = futures::stream::iter(operations)
+            .map(|(operation, indices)| async move { (operation.await, indices) })
+            .buffer_unordered(MEDIA_REUPLOAD_CONCURRENCY);
+        while let Some((result, indices)) = pending.next().await {
+            for index in indices {
+                results[index] = Some(result.clone());
+            }
+        }
+        results
+            .into_iter()
+            .map(|result| result.expect("each reserved input has an operation or conflict"))
             .collect()
-            .await
     }
 }
 
