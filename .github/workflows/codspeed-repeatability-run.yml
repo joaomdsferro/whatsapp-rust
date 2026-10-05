@@ -51,6 +51,7 @@ jobs:
         run: |
           git rev-parse HEAD
           sha256sum Cargo.lock wacore/libsignal/benches/*.rs wacore/libsignal/benches/support/session_fixture.rs
+          find target/codspeed -maxdepth 3 -type f -executable -exec sha256sum {} +
           rustc -Vv
           ldd --version
           lscpu
@@ -59,4 +60,7 @@ jobs:
         with:
           runner-version: 5.4.0
           mode: simulation,walltime
-          run: cargo codspeed run -p wacore-libsignal 'bench_session_with_self|bench_session_root_key_update|independent_sessions_32|successive_updates_32_sessions'
+          run: |
+            cargo codspeed run -p wacore-libsignal --bench libsignal_benchmark 'bench_session_with_self|bench_session_root_key_update'
+            cargo codspeed run -p wacore-libsignal --bench session_identity_isolated
+            cargo codspeed run -p wacore-libsignal --bench session_root_key_isolated

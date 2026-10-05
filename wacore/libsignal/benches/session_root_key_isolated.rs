@@ -1,11 +1,32 @@
 use divan::black_box;
-use wacore_libsignal::protocol::RootKey;
+use wacore_libsignal::protocol::{IdentityKey, KeyPair, RootKey, SessionState};
 
 #[path = "support/session_fixture.rs"]
 mod session_fixture;
 
 fn main() {
     divan::main();
+}
+
+// Retain the original single-call workload while testing process isolation.
+#[divan::bench]
+fn bench_session_root_key_update(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(|| {
+            let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(0x524f_4f54);
+            let local = IdentityKey::new(KeyPair::generate(&mut rng).public_key);
+            SessionState::new(
+                3,
+                &local,
+                &local,
+                &RootKey::new([0x11; 32]),
+                local.public_key(),
+            )
+        })
+        .bench_refs(|state| {
+            state.set_root_key(black_box(&RootKey::new([0x22; 32])));
+            black_box(&*state);
+        });
 }
 
 // One pass preserves the independent-record experiment. Thirty-two passes
