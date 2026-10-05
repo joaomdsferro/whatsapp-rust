@@ -9,6 +9,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: never
+  PROTOC_VERSION: "3.25.3"
   MALLOC_ARENA_MAX: "1"
   MALLOC_MMAP_THRESHOLD_: "131072"
   MALLOC_TRIM_THRESHOLD_: "131072"
@@ -21,8 +22,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          # All three independent workflow runs build this same immutable head.
-          ref: ${{ github.event.pull_request.head.sha }}
+          # Match the normal workflow's immutable merge commit for this event.
+          ref: ${{ github.sha }}
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@master
         with:
@@ -40,13 +41,17 @@ jobs:
         run: cargo xt ci workflow install-libc-debug
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-codspeed@5.0.1
+          tool: protoc@${{ env.PROTOC_VERSION }},cargo-codspeed@5.0.1
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: Linux-cargo-codspeed-repeatability
           cache-targets: "false"
       - name: Build diagnostic targets
-        run: cargo codspeed build -m simulation -m walltime -p wacore-libsignal
+        # Match the normal proto-signal shard's dependency feature unification.
+        run: >
+          cargo codspeed build -m simulation -m memory -m walltime
+          -p wacore-binary -p wacore-libsignal -p wacore-appstate
+          -p whatsapp-rust-sqlite-storage
       - name: Record fixed source and toolchain
         run: |
           git rev-parse HEAD
