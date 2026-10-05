@@ -1,4 +1,4 @@
-name: R03 original session walltime head 1
+name: R03 original session walltime base 3
 
 on:
   pull_request:
@@ -17,4 +17,4 @@ jobs:
       github.event.label.name == 'r03-walltime-fixed-revisions'
     uses: ./.github/workflows/codspeed-repeatability-run.yml
     with:
-      source-revision: c42dd44c59acff7825eae7d09e940a08c71d91a2
+      source-revision: f1080df166bbc2c88e762eda6eb5bb7f6efc2f05

@@ -1,7 +1,11 @@
-name: CodSpeed repeatability experiment
+name: Fixed-revision original session walltime
 
 on:
   workflow_call:
+    inputs:
+      source-revision:
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -17,13 +21,19 @@ env:
 
 jobs:
   diagnostic:
+    # Only the two reviewed same-repository revisions may execute with OIDC.
+    if: >-
+      github.repository == 'oxidezap/whatsapp-rust' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      (inputs.source-revision == 'f1080df166bbc2c88e762eda6eb5bb7f6efc2f05' ||
+       inputs.source-revision == 'c42dd44c59acff7825eae7d09e940a08c71d91a2')
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v7
         with:
-          # Match the normal workflow's immutable merge commit for this event.
-          ref: ${{ github.sha }}
+          repository: oxidezap/whatsapp-rust
+          ref: ${{ inputs.source-revision }}
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@master
         with:
@@ -49,23 +59,22 @@ jobs:
       - name: Build diagnostic targets
         # Match the normal proto-signal shard's dependency feature unification.
         run: >
-          cargo codspeed build -m simulation -m memory -m walltime
+          cargo codspeed build -m walltime
           -p wacore-binary -p wacore-libsignal -p wacore-appstate
           -p whatsapp-rust-sqlite-storage
       - name: Record fixed source and toolchain
         run: |
           git rev-parse HEAD
-          sha256sum Cargo.lock wacore/libsignal/benches/*.rs wacore/libsignal/benches/support/session_fixture.rs
+          sha256sum Cargo.lock wacore/libsignal/benches/libsignal_benchmark.rs
           find target/codspeed -maxdepth 3 -type f -executable -exec sha256sum {} +
           rustc -Vv
           ldd --version
           lscpu
-      - name: Measure original, batch, and isolated fixtures
+      # CodSpeed's run is attached to this diagnostic PR. The recorded checkout
+      # above, not that PR's head label, identifies the source being measured.
+      - name: Measure only original self and non-self session cases
         uses: CodSpeedHQ/action@v5
         with:
           runner-version: 5.4.0
-          mode: simulation,walltime
-          run: |
-            cargo codspeed run -p wacore-libsignal --bench libsignal_benchmark 'bench_session_with_self|bench_session_root_key_update'
-            cargo codspeed run -p wacore-libsignal --bench session_identity_isolated
-            cargo codspeed run -p wacore-libsignal --bench session_root_key_isolated
+          mode: walltime
+          run: cargo codspeed run -p wacore-libsignal --bench libsignal_benchmark 'bench_session_with_self'

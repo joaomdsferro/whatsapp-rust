@@ -1,8 +1,9 @@
-name: CodSpeed repeatability 1
+name: R03 original session walltime base 1
 
 on:
   pull_request:
     branches: [main]
+    types: [labeled]
 
 permissions:
   contents: read
@@ -10,5 +11,10 @@ permissions:
 
 jobs:
   diagnostic:
-    if: github.head_ref == 'bench/session-repeatability'
+    if: >-
+      github.head_ref == 'bench/session-repeatability' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.label.name == 'r03-walltime-fixed-revisions'
     uses: ./.github/workflows/codspeed-repeatability-run.yml
+    with:
+      source-revision: f1080df166bbc2c88e762eda6eb5bb7f6efc2f05
