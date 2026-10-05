@@ -47,5 +47,13 @@ futures = { workspace = true, features = ["executor"] }
 name = "libsignal_benchmark"
 harness = false
 
+[[bench]]
+name = "session_identity_isolated"
+harness = false
+
+[[bench]]
+name = "session_root_key_isolated"
+harness = false
+
 [lints]
 workspace = true

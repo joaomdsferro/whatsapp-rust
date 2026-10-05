@@ -46,17 +46,17 @@ jobs:
           prefix-key: Linux-cargo-codspeed-repeatability
           cache-targets: "false"
       - name: Build diagnostic targets
-        run: cargo codspeed build -m simulation -m walltime -p wacore-libsignal --bench libsignal_benchmark
+        run: cargo codspeed build -m simulation -m walltime -p wacore-libsignal
       - name: Record fixed source and toolchain
         run: |
           git rev-parse HEAD
-          sha256sum Cargo.lock wacore/libsignal/benches/libsignal_benchmark.rs
+          sha256sum Cargo.lock wacore/libsignal/benches/*.rs wacore/libsignal/benches/support/session_fixture.rs
           rustc -Vv
           ldd --version
           lscpu
-      - name: Measure the proposed batch fixtures
+      - name: Measure original, batch, and isolated fixtures
         uses: CodSpeedHQ/action@v5
         with:
           runner-version: 5.4.0
           mode: simulation,walltime
-          run: cargo codspeed run -p wacore-libsignal --bench libsignal_benchmark 'bench_session_with_self|bench_session_root_key_update'
+          run: cargo codspeed run -p wacore-libsignal 'bench_session_with_self|bench_session_root_key_update|independent_sessions_32|successive_updates_32_sessions'
