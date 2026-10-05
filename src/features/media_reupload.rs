@@ -334,8 +334,8 @@ impl<'a> MediaReupload<'a> {
         // Collect before awaiting: retaining the map in the stream prevents
         // MSRV callers from proving this future is Send.
         let operations: Vec<_> = operations.into_iter().map(complete).collect();
-        let mut pending = futures::stream::iter(operations)
-            .buffer_unordered(MEDIA_REUPLOAD_CONCURRENCY);
+        let mut pending =
+            futures::stream::iter(operations).buffer_unordered(MEDIA_REUPLOAD_CONCURRENCY);
         while let Some((result, indices)) = pending.next().await {
             for index in indices {
                 results[index] = Some(result.clone());

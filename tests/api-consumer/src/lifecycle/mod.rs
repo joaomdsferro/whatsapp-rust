@@ -64,6 +64,7 @@ pub fn sendable_batch_recovery<'a>(
     requests: &'a [whatsapp_rust::MediaReuploadRequest<'a>],
 ) -> impl std::future::Future<
     Output = Vec<Result<whatsapp_rust::MediaRetryResult, whatsapp_rust::MediaReuploadError>>,
-> + Send + 'a {
+> + Send
++ 'a {
     async move { client.media_reupload().request_many(requests).await }
 }
