@@ -193,3 +193,31 @@ async fn connected_history_identity_seed_is_durable_for_both_backends() -> Resul
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn connected_history_after_startup_is_durable_and_does_not_repeat_startup() -> Result<()> {
+    use whatsapp_rust::bench_support::connected_idle::HISTORY_IDENTITIES;
+    #[cfg(feature = "sqlite-storage")]
+    let backends = [BackendFixture::memory(), BackendFixture::sqlite().await?];
+    #[cfg(not(feature = "sqlite-storage"))]
+    let backends = [BackendFixture::memory()];
+    for backend in backends {
+        let session = Session::connect(backend.backend()).await?;
+        session.finish_control().await?;
+        let initialization_iqs = session.initialization_iqs();
+        ensure!(initialization_iqs > 0);
+        let activity = session.prepare_history_identity_activity().await?;
+        session.receive_live_activity(activity).await?;
+        ensure!(session.initialization_iqs() == initialization_iqs);
+        let rows = backend.backend().get_all_lid_mappings().await?;
+        for i in 0..HISTORY_IDENTITIES {
+            ensure!(rows.iter().any(|row| row.lid == format!("1000000001{i:05}")
+                && row.phone_number == format!("1555001{i:05}")
+                && row.learning_source == "other"));
+        }
+        ensure!(session.checkpoint().await.connected);
+        session.shutdown().await?;
+        backend.cleanup()?;
+    }
+    Ok(())
+}

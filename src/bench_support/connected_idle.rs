@@ -430,6 +430,22 @@ impl Session {
     /// workers. History enters the production inline-history parser/task (no HTTP).
     /// Finish the server's offline phase and wait for commit/event/receipt work.
     pub async fn receive_activity(&self, activity: Activity) -> Result<()> {
+        self.receive_activity_inner(activity, true).await
+    }
+
+    /// Receive on a live session after `finish_control()` has joined startup.
+    /// This does not inject a second offline-complete notification.
+    pub async fn receive_live_activity(&self, activity: Activity) -> Result<()> {
+        let initialization_iqs = self.initialization_iqs();
+        self.receive_activity_inner(activity, false).await?;
+        ensure!(
+            self.initialization_iqs() == initialization_iqs,
+            "initialization overlapped live activity"
+        );
+        Ok(())
+    }
+
+    async fn receive_activity_inner(&self, activity: Activity, offline: bool) -> Result<()> {
         for node in activity.stanzas {
             self.wire.reply(node).await?;
         }
@@ -461,7 +477,9 @@ impl Session {
                 "history identity {i} was not durably persisted"
             );
         }
-        self.finish_offline(MESSAGES).await?;
+        if offline {
+            self.finish_offline(MESSAGES).await?;
+        }
         self.wait_until(|| self.counts.messages.load(Ordering::Relaxed) == MESSAGES)
             .await?;
         ensure!(
