@@ -47,6 +47,13 @@ jobs:
           cache-targets: "false"
       - name: Build diagnostic targets
         run: cargo codspeed build -m simulation -m walltime -p wacore-libsignal --bench libsignal_benchmark
+      - name: Record fixed source and toolchain
+        run: |
+          git rev-parse HEAD
+          sha256sum Cargo.lock wacore/libsignal/benches/libsignal_benchmark.rs wacore/libsignal/benches/support/session_repeatability.rs
+          rustc -Vv
+          ldd --version
+          lscpu
       - name: Measure original and candidate fixtures on the same runner
         uses: CodSpeedHQ/action@v5
         with:
