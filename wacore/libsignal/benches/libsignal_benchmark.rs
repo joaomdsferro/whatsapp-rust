@@ -2,11 +2,6 @@ use std::collections::HashMap;
 
 use bytes::Bytes;
 
-// Temporary experiments for the repeatability draft; production benches above
-// and below remain unchanged until the repeated CodSpeed results are available.
-#[path = "support/session_repeatability.rs"]
-mod session_repeatability;
-
 /// SipHash with fixed keys: the default RandomState seeds per process, so
 /// bucket layout (and thus cache behavior) differed between benchmark runs.
 type DetState = std::hash::BuildHasherDefault<std::hash::DefaultHasher>;
@@ -946,11 +941,14 @@ fn bench_sender_key_serialize_without_backlog(bencher: divan::Bencher) {
         .bench_refs(|record| black_box(record.serialize().expect("serialize sender key")));
 }
 
-#[divan::bench(args = [false, true])]
-fn bench_session_with_self(bencher: divan::Bencher, is_self: bool) {
-    bencher
-        .with_inputs(|| {
-            let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(0x5345_4c46);
+// A single call's simulation cost is dominated by cold cache-line placement.
+// Visit independent sessions once each to amortize code-cache startup without
+// repeatedly warming the same record. Keep the batch size in the benchmark ID:
+// the result is a batch total, and CodSpeed's simulation adapter ignores counters.
+fn session_state_batch(count: usize, is_self: bool) -> Vec<SessionState> {
+    let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(0x5345_4c46);
+    (0..count)
+        .map(|_| {
             let local = IdentityKey::new(KeyPair::generate(&mut rng).public_key);
             let remote = if is_self {
                 local
@@ -965,26 +963,30 @@ fn bench_session_with_self(bencher: divan::Bencher, is_self: bool) {
                 local.public_key(),
             )
         })
-        .bench_refs(|state| black_box(state.session_with_self().expect("identities")));
+        .collect()
 }
 
-#[divan::bench]
-fn bench_session_root_key_update(bencher: divan::Bencher) {
+#[divan::bench(args = [(false, 32), (true, 32)])]
+fn bench_session_with_self(bencher: divan::Bencher, (is_self, count): (bool, usize)) {
     bencher
-        .with_inputs(|| {
-            let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(0x524f_4f54);
-            let local = IdentityKey::new(KeyPair::generate(&mut rng).public_key);
-            SessionState::new(
-                3,
-                &local,
-                &local,
-                &RootKey::new([0x11; 32]),
-                local.public_key(),
-            )
-        })
-        .bench_refs(|state| {
-            state.set_root_key(black_box(&RootKey::new([0x22; 32])));
-            black_box(&*state);
+        .with_inputs(|| session_state_batch(count, is_self))
+        .bench_refs(|states| {
+            for state in states.iter() {
+                black_box(black_box(state).session_with_self().expect("identities"));
+            }
+        });
+}
+
+#[divan::bench(args = [32])]
+fn bench_session_root_key_update(bencher: divan::Bencher, count: usize) {
+    bencher
+        .with_inputs(|| session_state_batch(count, true))
+        .bench_refs(|states| {
+            let key = RootKey::new([0x22; 32]);
+            for state in states.iter_mut() {
+                black_box(&mut *state).set_root_key(black_box(&key));
+                black_box(&*state);
+            }
         });
 }
 

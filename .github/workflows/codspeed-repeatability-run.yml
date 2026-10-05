@@ -50,13 +50,13 @@ jobs:
       - name: Record fixed source and toolchain
         run: |
           git rev-parse HEAD
-          sha256sum Cargo.lock wacore/libsignal/benches/libsignal_benchmark.rs wacore/libsignal/benches/support/session_repeatability.rs
+          sha256sum Cargo.lock wacore/libsignal/benches/libsignal_benchmark.rs
           rustc -Vv
           ldd --version
           lscpu
-      - name: Measure original and candidate fixtures on the same runner
+      - name: Measure the proposed batch fixtures
         uses: CodSpeedHQ/action@v5
         with:
           runner-version: 5.4.0
           mode: simulation,walltime
-          run: cargo codspeed run -p wacore-libsignal --bench libsignal_benchmark session_
+          run: cargo codspeed run -p wacore-libsignal --bench libsignal_benchmark 'bench_session_with_self|bench_session_root_key_update'
