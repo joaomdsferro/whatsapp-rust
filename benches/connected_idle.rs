@@ -37,7 +37,7 @@ fn runtime() -> tokio::runtime::Runtime {
         .expect("fixture runtime")
 }
 
-fn run_activity(bencher: divan::Bencher, sqlite: bool, identities: bool) {
+fn run_activity(bencher: divan::Bencher, sqlite: bool, identities: bool, after_startup: bool) {
     let rt = runtime();
     bencher
         .with_inputs(|| {
@@ -48,6 +48,9 @@ fn run_activity(bencher: divan::Bencher, sqlite: bool, identities: bool) {
                     BackendFixture::memory()
                 };
                 let session = Session::connect(backend.backend()).await.expect("connect");
+                if after_startup {
+                    session.finish_control().await.expect("join startup");
+                }
                 let activity = if identities {
                     session.prepare_history_identity_activity().await
                 } else {
@@ -64,25 +67,33 @@ fn run_activity(bencher: divan::Bencher, sqlite: bool, identities: bool) {
         })
         .bench_local_refs(|fixture| {
             // Input destruction (including graceful shutdown) is outside the timed region.
-            rt.block_on(
-                fixture
-                    .session
-                    .as_ref()
-                    .expect("session")
-                    .receive_activity(fixture.activity.take().expect("one activity per input")),
-            )
+            rt.block_on(async {
+                let session = fixture.session.as_ref().expect("session");
+                let activity = fixture.activity.take().expect("one activity per input");
+                if after_startup {
+                    session.receive_live_activity(activity).await
+                } else {
+                    session.receive_activity(activity).await
+                }
+            })
             .expect("all messages committed and dispatched");
         });
 }
 
 #[divan::bench(args = [false, true], sample_count = 5, sample_size = 1)]
 fn activity_peak(bencher: divan::Bencher, sqlite: bool) {
-    run_activity(bencher, sqlite, false);
+    run_activity(bencher, sqlite, false, false);
 }
 
 #[divan::bench(args = [false, true], sample_count = 5, sample_size = 1)]
 fn history_identity_activity(bencher: divan::Bencher, sqlite: bool) {
-    run_activity(bencher, sqlite, true);
+    run_activity(bencher, sqlite, true, false);
+}
+
+/// Startup is joined outside measurement; history identities are still new.
+#[divan::bench(args = [false, true], sample_count = 5, sample_size = 1)]
+fn history_identity_after_startup(bencher: divan::Bencher, sqlite: bool) {
+    run_activity(bencher, sqlite, true, true);
 }
 
 #[divan::bench(args = [false, true], sample_count = 5, sample_size = 1)]
