@@ -1,0 +1,14 @@
+name: CodSpeed repeatability 3
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  diagnostic:
+    if: github.head_ref == 'bench/session-repeatability'
+    uses: ./.github/workflows/codspeed-repeatability-run.yml

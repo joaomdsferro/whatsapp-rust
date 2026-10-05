@@ -1,0 +1,55 @@
+name: CodSpeed repeatability experiment
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  CARGO_TERM_COLOR: never
+  MALLOC_ARENA_MAX: "1"
+  MALLOC_MMAP_THRESHOLD_: "131072"
+  MALLOC_TRIM_THRESHOLD_: "131072"
+  MALLOC_TOP_PAD_: "131072"
+
+jobs:
+  diagnostic:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # All three independent workflow runs build this same immutable head.
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-06-16
+      - name: Key libc debug cache
+        id: libc6
+        run: cargo xt ci workflow libc-version
+      - uses: actions/cache@v6
+        with:
+          path: ~/.cache/libc6-dbg
+          key: libc6-dbg-${{ runner.arch }}-${{ steps.libc6.outputs.version }}
+      - name: Install libc debug symbols
+        env:
+          LIBC6_VERSION: ${{ steps.libc6.outputs.version }}
+        run: cargo xt ci workflow install-libc-debug
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-codspeed@5.0.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: Linux-cargo-codspeed-repeatability
+          cache-targets: "false"
+      - name: Build diagnostic targets
+        run: cargo codspeed build -m simulation -m walltime -p wacore-libsignal --bench libsignal_benchmark
+      - name: Measure original and candidate fixtures on the same runner
+        uses: CodSpeedHQ/action@v5
+        with:
+          runner-version: 5.4.0
+          mode: simulation,walltime
+          run: cargo codspeed run -p wacore-libsignal --bench libsignal_benchmark session_

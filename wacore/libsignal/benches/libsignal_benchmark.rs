@@ -2,6 +2,11 @@ use std::collections::HashMap;
 
 use bytes::Bytes;
 
+// Temporary experiments for the repeatability draft; production benches above
+// and below remain unchanged until the repeated CodSpeed results are available.
+#[path = "support/session_repeatability.rs"]
+mod session_repeatability;
+
 /// SipHash with fixed keys: the default RandomState seeds per process, so
 /// bucket layout (and thus cache behavior) differed between benchmark runs.
 type DetState = std::hash::BuildHasherDefault<std::hash::DefaultHasher>;
