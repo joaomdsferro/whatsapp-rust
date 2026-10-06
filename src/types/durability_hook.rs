@@ -23,6 +23,11 @@ use waproto::whatsapp as wa;
 /// accepts legacy single-message records, but older SDKs cannot read the new
 /// multipart format. Existing rows from a previous process are replayed when a
 /// corresponding inbound delivery reaches the replay path, not scanned at startup.
+/// Group replay reads all original sender keys for that chat/id and filters the
+/// established device-less participant identity without merging PN and LID.
+/// Corrupt or conflicting matching rows fail closed. Only rows read for the
+/// successful commit (and rows it wrote) are removed; unrelated participants,
+/// chats, message ids and backend devices are preserved.
 ///
 /// Receipt suppression does not guarantee another server delivery. If the
 /// process stops or the Client is dropped before a pending copy is persisted,
@@ -47,10 +52,12 @@ use waproto::whatsapp as wa;
 /// live limit and per-chat receive serialization. Retries may follow newer
 /// deliveries, and an entered hook can outlive its connection. Persistent storage
 /// capacity across process restarts is the backend/operator's responsibility;
-/// the store interface does not enumerate or impose a quota on pending rows.
+/// the store interface does not scan pending rows at startup or impose a quota.
 ///
-/// The builder probes the backend's individual pending-inbound store/read/delete
-/// operations and rejects unsupported backends with
+/// The builder probes pending-inbound store, exact read, participant-candidate
+/// read and delete operations. Custom backends must implement
+/// [`ProtocolStore::get_pending_inbound_for_message`](crate::store::traits::ProtocolStore::get_pending_inbound_for_message)
+/// in addition to the existing buffer methods. Unsupported backends are rejected with
 /// [`ClientBuilderError::UnsupportedDurabilityBackend`](crate::ClientBuilderError::UnsupportedDurabilityBackend).
 /// Custom batch overrides must preserve their semantics. History capture is
 /// configured independently through [`HistorySyncCaptureHook`]; this hook alone
