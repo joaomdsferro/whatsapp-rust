@@ -32,8 +32,11 @@ use waproto::whatsapp as wa;
 /// Retries can repeat a successful consumer commit whose receipt or cleanup
 /// failed, and batch boundaries can change. Make commits idempotent by source
 /// and id — `(info.source.chat, info.source.sender, info.id)` — while preserving
-/// the ordered payloads within that identity: one stanza can contain several
-/// distinct parts with the same id. A partial batch commit must be safe to retry.
+/// the ordered payloads and their multiplicity: one stanza can contain several
+/// equal parts with the same id. For group/broadcast authors, device-qualified
+/// and device-less spellings identify the same message, as in the event dispatch
+/// gate; PN and LID remain separate namespaces. Original metadata and stored
+/// keys are preserved. A partial batch commit must be safe to retry.
 ///
 /// Admission counts queued, processing and retained stanzas together: at most
 /// 400 stanzas and a 4 MiB budget of original decoded-frame lengths. One larger
@@ -44,8 +47,7 @@ use waproto::whatsapp as wa;
 /// live limit and per-chat receive serialization. Retries may follow newer
 /// deliveries, and an entered hook can outlive its connection. Persistent storage
 /// capacity across process restarts is the backend/operator's responsibility;
-/// the store interface does
-/// not enumerate or impose a quota on pending rows.
+/// the store interface does not enumerate or impose a quota on pending rows.
 ///
 /// The builder probes the backend's individual pending-inbound store/read/delete
 /// operations and rejects unsupported backends with
