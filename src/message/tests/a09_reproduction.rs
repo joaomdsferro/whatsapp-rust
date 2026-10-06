@@ -1300,3 +1300,93 @@ async fn pending_lookup_in_a_dm_does_not_merge_sender_devices() {
         b"\0unreadable other device"
     );
 }
+
+async fn restart_contained_alias(bodies: &[&str], exact: &[&str], extra_prefix: bool) {
+    let mut f = Fixture::new("RESTART_CONTAINED_ALIAS", false).await;
+    let group: Jid = "120363000000000029@g.us".parse().unwrap();
+    let mut peer = joined_group_sender(&f.client, "100000000000029:75@lid", &group).await;
+    f.stanza = p1_group_parts(&mut peer, &group, &f.info.id, bodies).await;
+    f.info = f.client.parse_message_info(f.stanza.get()).await.unwrap();
+    f.hook.fail.store(true, Ordering::SeqCst);
+    f.receive().await;
+    let original = f.pending().await.unwrap();
+    let backend = f.client.persistence_manager.backend();
+    let chat = group.to_string();
+    let id = f.info.id.to_string();
+    let alias = peer.jid.to_non_ad().to_string();
+    let encode = |parts: &[&str]| {
+        let bytes: Vec<Vec<u8>> = parts
+            .iter()
+            .map(|body| {
+                let mut message = wa::Message::default();
+                message.conversation = Some((*body).into());
+                let mut bytes = Vec::new();
+                waproto::codec::message_encode_into(&message, &mut bytes);
+                bytes
+            })
+            .collect();
+        if bytes.len() == 1 {
+            bytes[0].clone()
+        } else {
+            durability::encode_pending_parts(&bytes.iter().map(Vec::as_slice).collect::<Vec<_>>())
+        }
+    };
+    let exact_bytes = encode(exact);
+    backend
+        .store_pending_inbound(&chat, &alias, &id, &exact_bytes)
+        .await
+        .unwrap();
+    let extra = "100000000000029:76@lid";
+    if extra_prefix {
+        backend
+            .store_pending_inbound(&chat, extra, &id, &encode(&bodies[..1]))
+            .await
+            .unwrap();
+    }
+    f.restart().await;
+    f.stanza = with_participant(&f.stanza, &peer.jid.to_non_ad());
+    f.receive().await;
+    assert_eq!(
+        f.hook.attempts.load(Ordering::SeqCst),
+        bodies.len(),
+        "a complete compatible alias must replay in its recorded order"
+    );
+    assert_eq!(f.receipts(), 0);
+    assert_eq!(f.pending().await.unwrap(), original);
+    let extended = backend
+        .get_pending_inbound(&chat, &alias, &id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        durability::decode_pending_parts(&extended)
+            .unwrap()
+            .iter()
+            .map(|message| message.conversation.as_deref().unwrap())
+            .collect::<Vec<_>>(),
+        bodies
+    );
+    f.hook.fail.store(false, Ordering::SeqCst);
+    f.receive().await;
+    assert_eq!(f.hook.committed.load(Ordering::SeqCst), bodies.len());
+    assert_eq!(f.published(), bodies);
+    assert_eq!(f.receipts(), 1);
+    for sender in [peer.jid.to_string(), alias, extra.to_owned()] {
+        assert!(
+            backend
+                .get_pending_inbound(&chat, &sender, &id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+    assert_eq!(f.client.inbound_commit_batch.retention.stats(), (0, 0));
+}
+#[tokio::test]
+async fn restart_contained_alias_exact_tail_uses_complete_recorded_sequence() {
+    restart_contained_alias(&["A", "B"], &["B"], false).await;
+}
+#[tokio::test]
+async fn restart_contained_alias_preserves_repeated_parts_and_all_keys() {
+    restart_contained_alias(&["A", "A", "B"], &["A", "B"], true).await;
+}
