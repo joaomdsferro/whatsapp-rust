@@ -702,3 +702,37 @@ async fn resident_failures_recover_without_another_server_delivery() {
         }
     }
 }
+
+#[tokio::test]
+async fn reconnect_waits_for_an_older_drain_commit_of_the_same_identity() {
+    let f = Fixture::new("DRAIN_RESET_COMMIT", true).await;
+    f.hook.pause_first.store(true, Ordering::SeqCst);
+    f.receive().await;
+    let client = f.client.clone();
+    let old_commit = tokio::spawn(async move {
+        client
+            .flush_inbound_commits_under_permit(false, None, None)
+            .await
+    });
+    f.hook.entered.notified().await;
+    f.client.cleanup_connection_state().await;
+    f.client.enter_live_mode_for_tests();
+    let mut new_delivery = tokio::spawn(f.client.clone().handle_incoming_message(f.stanza.clone()));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), &mut new_delivery,)
+            .await
+            .is_err(),
+        "a new connection must not replace an in-progress commit"
+    );
+    assert_eq!(f.hook.attempts.load(Ordering::SeqCst), 1);
+    assert!(f.published().is_empty());
+    f.hook.release.notify_one();
+    assert!(old_commit.await.unwrap());
+    tokio::time::timeout(std::time::Duration::from_secs(2), new_delivery)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(f.hook.committed.load(Ordering::SeqCst), 1);
+    assert_eq!(f.published(), ["synthetic retained body"]);
+    assert_eq!(f.client.inbound_commit_batch.retention.stats().0, 0);
+}
