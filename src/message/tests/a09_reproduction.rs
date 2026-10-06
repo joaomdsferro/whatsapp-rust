@@ -1314,14 +1314,18 @@ async fn restart_contained_alias(bodies: &[&str], exact: &[&str], extra_prefix: 
     let chat = group.to_string();
     let id = f.info.id.to_string();
     let alias = peer.jid.to_non_ad().to_string();
+    let recorded = durability::decode_pending_parts(&original).unwrap();
     let encode = |parts: &[&str]| {
         let bytes: Vec<Vec<u8>> = parts
             .iter()
             .map(|body| {
-                let mut message = wa::Message::default();
-                message.conversation = Some((*body).into());
+                // Reuse every wire field, including the fixture's unknown field.
+                let message = recorded
+                    .iter()
+                    .find(|message| message.conversation.as_deref() == Some(*body))
+                    .unwrap();
                 let mut bytes = Vec::new();
-                waproto::codec::message_encode_into(&message, &mut bytes);
+                waproto::codec::message_encode_into(message, &mut bytes);
                 bytes
             })
             .collect();
