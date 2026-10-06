@@ -595,7 +595,9 @@ impl Client {
                 .begin(&info, admission)
                 .await;
             if self.connection_generation.load(Ordering::Acquire) != lane_generation {
-                self.inbound_commit_batch.retention.discard_empty(&info);
+                self.inbound_commit_batch
+                    .retention
+                    .abandon_collection(&info);
                 for payload in session_payloads
                     .iter()
                     .chain(&group_payloads)
@@ -632,13 +634,15 @@ impl Client {
                                         .build()
                                 })
                                 .collect();
-                            self.inbound_commit_batch.retention.stage(&items, false);
+                            self.inbound_commit_batch.retention.seed_replay(items);
                         }
                         Err(error) => {
                             log::error!(
                                 "Pending inbound record cannot be decoded; preserving it without decrypting another delivery: {error:?}"
                             );
-                            self.inbound_commit_batch.retention.discard_empty(&info);
+                            self.inbound_commit_batch
+                                .retention
+                                .abandon_collection(&info);
                             return;
                         }
                     },
@@ -647,7 +651,9 @@ impl Client {
                         log::warn!(
                             "Pending inbound read failed before decrypt; withholding receipt: {error:?}"
                         );
-                        self.inbound_commit_batch.retention.discard_empty(&info);
+                        self.inbound_commit_batch
+                            .retention
+                            .abandon_collection(&info);
                         return;
                     }
                 }

@@ -123,11 +123,9 @@ impl InboundCommitBatcher {
 
     pub(crate) fn remove_retained_identity(&self, info: &MessageInfo) {
         let mut state = self.lock();
-        state.entries.retain(|item| {
-            item.info.id != info.id
-                || item.info.source.chat != info.source.chat
-                || item.info.source.sender != info.source.sender
-        });
+        state
+            .entries
+            .retain(|item| retention::key(&item.info) != retention::key(info));
         state.bytes = state
             .entries
             .iter()
@@ -819,7 +817,15 @@ impl Client {
     /// them, losing content with nothing left to redeliver it. Comparing the
     /// message keeps them and costs a structural compare only where identities
     /// actually collide, which is the rare case this whole function exists for.
+    #[cfg(test)]
     fn dedup_batch_by_message(&self, items: Arc<[InboundMessage]>) -> Arc<[InboundMessage]> {
+        self.dedup_batch_with_retention(items, None)
+    }
+    fn dedup_batch_with_retention(
+        &self,
+        items: Arc<[InboundMessage]>,
+        retained: Option<&retention::RetentionCommit>,
+    ) -> Arc<[InboundMessage]> {
         if items.len() < 2 {
             return items;
         }
@@ -850,7 +856,11 @@ impl Client {
             buf
         }
         type Seen = std::collections::HashMap<DispatchKey, Vec<Kept>>;
-        fn keep(seen: &mut Seen, item: &InboundMessage) -> bool {
+        fn keep(
+            seen: &mut Seen,
+            item: &InboundMessage,
+            retained: Option<&retention::RetentionCommit>,
+        ) -> bool {
             let kept = seen.entry(Client::dispatch_key(&item.info)).or_default();
             if kept.len() >= MAX_COMPARED_PER_ID {
                 return true;
@@ -867,7 +877,11 @@ impl Client {
                 // separate stanzas always allocate separate infos, so this
                 // never exempts a genuine resend, while a part whose info was
                 // copied on write falls through to the content compare.
-                if Arc::ptr_eq(&k.info, &item.info) {
+                if Arc::ptr_eq(&k.info, &item.info)
+                    || retained.is_some_and(|r| {
+                        r.owns(&item.info) && retention::key(&k.info) == retention::key(&item.info)
+                    })
+                {
                     continue;
                 }
                 if Arc::ptr_eq(&k.message, &item.message) {
@@ -897,13 +911,13 @@ impl Client {
             true
         }
         let mut seen = Seen::with_capacity(items.len());
-        if items.iter().all(|item| keep(&mut seen, item)) {
+        if items.iter().all(|item| keep(&mut seen, item, retained)) {
             return items;
         }
         seen.clear();
         let kept: Arc<[InboundMessage]> = items
             .iter()
-            .filter(|item| keep(&mut seen, item))
+            .filter(|item| keep(&mut seen, item, retained))
             .cloned()
             .collect();
         // Counted like any other suppression: what this drops never reaches a
@@ -1088,21 +1102,24 @@ impl Client {
         // acked from `arrived`; only what the hook and the consumer see is
         // reduced to one copy.
         let arrived = Arc::clone(&items);
-        let items = if self.dispatch_gate_enabled() {
-            self.dedup_batch_by_message(items)
-        } else {
-            items
-        };
+        // Own every physical arrival before payload deduplication. Dropped
+        // payloads still hold admission leases and need their commit settled.
         let mut reinsert = ReinsertGuard {
             batcher: &self.inbound_commit_batch,
             items: is_drain.then(|| Arc::clone(&items)),
             commit_ticket,
-            retained: None,
+            retained: self.inbound_commit_batch.retention.commit(&items),
         };
-        reinsert.retained = self.inbound_commit_batch.retention.commit(&items);
-        if reinsert.retained.is_none() {
+        let Some(retained) = &reinsert.retained else {
             return false;
-        }
+        };
+        let items = retained.canonical_items(items);
+        let items = if self.dispatch_gate_enabled() {
+            self.dedup_batch_with_retention(items, Some(retained))
+        } else {
+            items
+        };
+        reinsert.items = is_drain.then(|| Arc::clone(&items));
         #[cfg(test)]
         if self
             .inbound_commit_batch
