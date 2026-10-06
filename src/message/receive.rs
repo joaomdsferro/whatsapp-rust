@@ -589,7 +589,27 @@ impl Client {
         }
 
         if self.inbound_durability_hook().is_some() {
-            let fresh = self.inbound_commit_batch.retention.begin(&info, admission);
+            let fresh = self
+                .inbound_commit_batch
+                .retention
+                .begin(&info, admission)
+                .await;
+            if self.connection_generation.load(Ordering::Acquire) != lane_generation {
+                self.inbound_commit_batch.retention.discard_empty(&info);
+                for payload in session_payloads
+                    .iter()
+                    .chain(&group_payloads)
+                    .chain(&bot_payloads)
+                {
+                    self.report_enc_decrypt_failure(
+                        &info,
+                        payload.enc_index,
+                        payload.enc_type.as_wire_str(),
+                        EncDecryptFailureReason::NotAttempted,
+                    );
+                }
+                return;
+            }
             self.inbound_commit_batch.remove_retained_identity(&info);
             if fresh {
                 let backend = self.persistence_manager.backend();

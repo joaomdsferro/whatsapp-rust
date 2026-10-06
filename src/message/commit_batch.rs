@@ -297,11 +297,17 @@ struct ReinsertGuard<'a> {
     batcher: &'a InboundCommitBatcher,
     items: Option<Arc<[InboundMessage]>>,
     commit_ticket: Option<InboundCommitTicket>,
+    // Fields drop after our Drop implementation: restore the batch before
+    // waking a producer that was waiting for this identity's commit.
+    retained: Option<super::retention::RetentionCommit>,
 }
 
 impl ReinsertGuard<'_> {
     fn mark_durable(&mut self) {
         self.items = None;
+        if let Some(retained) = &self.retained {
+            retained.durable();
+        }
         if let Some(ticket) = self.commit_ticket.take() {
             ticket.mark_durable();
         }
@@ -960,10 +966,12 @@ impl Client {
             batcher: &self.inbound_commit_batch,
             items: is_drain.then(|| Arc::clone(&items)),
             commit_ticket,
+            retained: None,
         };
-        let Some(mut retained) = self.inbound_commit_batch.retention.commit(&items) else {
+        reinsert.retained = self.inbound_commit_batch.retention.commit(&items);
+        if reinsert.retained.is_none() {
             return false;
-        };
+        }
         #[cfg(test)]
         if self
             .inbound_commit_batch
@@ -1132,7 +1140,6 @@ impl Client {
             // point is reached. The separate retention guard still keeps
             // plaintext for local retry if the hook fails or is cancelled.
             reinsert.mark_durable();
-            retained.durable();
 
             if let Err(e) = hook.on_messages(self.clone(), &items).await {
                 log::warn!(
@@ -1197,7 +1204,11 @@ impl Client {
         }
 
         reinsert.mark_durable();
-        retained.complete();
+        reinsert
+            .retained
+            .as_mut()
+            .expect("retention commit acquired")
+            .complete();
         #[cfg(test)]
         self.inbound_commit_batch
             .publication_reached

@@ -54,6 +54,7 @@ struct Stanza {
     receipt: bool,
     ticket: Option<InboundCommitTicket>,
     admissions: Vec<Arc<InboundAdmission>>,
+    commit_waiters: Vec<futures::channel::oneshot::Sender<()>>,
 }
 #[derive(Default)]
 pub(crate) struct InboundRetention {
@@ -97,17 +98,44 @@ impl InboundRetention {
         let budget = lock(&self.budget);
         (budget.count, budget.bytes)
     }
-    pub(crate) fn begin(&self, info: &MessageInfo, admission: Option<InboundAdmission>) -> bool {
+    pub(crate) async fn begin(
+        &self,
+        info: &MessageInfo,
+        mut admission: Option<InboundAdmission>,
+    ) -> bool {
+        loop {
+            match self.try_begin(info, &mut admission) {
+                Ok(fresh) => return fresh,
+                Err(wait) => {
+                    // A drain hook can outlive the connection's semaphore.
+                    // Preserve its identity until its commit guard settles.
+                    let _ = wait.await;
+                }
+            }
+        }
+    }
+    fn try_begin(
+        &self,
+        info: &MessageInfo,
+        admission: &mut Option<InboundAdmission>,
+    ) -> Result<bool, futures::channel::oneshot::Receiver<()>> {
         self.active.store(true, Ordering::Release);
         let mut stanzas = lock(&self.stanzas);
+        if let Some(stanza) = stanzas.get_mut(&key(info))
+            && stanza.state == State::Committing
+        {
+            let (wake, wait) = futures::channel::oneshot::channel();
+            stanza.commit_waiters.push(wake);
+            return Err(wait);
+        }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         if let Some(stanza) = stanzas.get_mut(&key(info)) {
             // The chat gate and processing permit exclude its commit. Preserve
             // prior parts while a re-encrypted resend is examined for new parts.
             stanza.id = id;
             stanza.state = State::Collecting;
-            stanza.admissions.extend(admission.map(Arc::new));
-            return false;
+            stanza.admissions.extend(admission.take().map(Arc::new));
+            return Ok(false);
         }
         stanzas.insert(
             key(info),
@@ -117,10 +145,11 @@ impl InboundRetention {
                 state: State::Collecting,
                 receipt: false,
                 ticket: None,
-                admissions: admission.map(Arc::new).into_iter().collect(),
+                admissions: admission.take().map(Arc::new).into_iter().collect(),
+                commit_waiters: Vec::new(),
             },
         );
-        true
+        Ok(true)
     }
     pub(crate) fn stage(
         &self,
@@ -336,7 +365,12 @@ impl Drop for RetentionCommit {
         let mut stanzas = lock(&self.retention.stanzas);
         for key in &self.keys {
             if let Some(stanza) = stanzas.get_mut(key) {
-                stanza.state = State::Retry;
+                // A cancelled drain first restores its batch. Keep that
+                // state; otherwise the resident retry owns the next attempt.
+                if stanza.state == State::Committing {
+                    stanza.state = State::Retry;
+                }
+                stanza.commit_waiters.clear();
             }
         }
     }
@@ -384,8 +418,9 @@ impl Client {
                         return;
                     }
                     let retention = &client.inbound_commit_batch.retention;
-                    if client.inbound_commit_batch.is_active()
-                        && client.inbound_commit_batch.has_entries()
+                    // A failed old drain can restore entries after a newer
+                    // connection has already entered live mode.
+                    if client.inbound_commit_batch.has_entries()
                         && !retention.drain_retry.swap(true, Ordering::AcqRel)
                     {
                         let client = Arc::clone(&client);
@@ -471,13 +506,13 @@ mod tests {
         drop(oversized);
         assert_eq!(retention.stats(), (0, 0));
     }
-    #[test]
-    fn cancelled_commit_and_retry_keep_parts_and_reservation() {
+    #[tokio::test]
+    async fn cancelled_commit_and_retry_keep_parts_and_reservation() {
         let retention = Arc::new(InboundRetention::default());
         let first = item("multipart", "first");
         let mut second = item("multipart", "second");
         second.info = Arc::clone(&first.info);
-        assert!(retention.begin(&first.info, retention.admit(123)));
+        assert!(retention.begin(&first.info, retention.admit(123)).await);
         assert!(retention.defer_receipt(&first.info));
         retention.stage(&[first.clone(), second], true).unwrap();
         let (items, receipt) = retention.seal(&first.info, false);
@@ -500,13 +535,13 @@ mod tests {
         drop(attempt);
         assert_eq!(retention.stats(), (0, 0));
     }
-    #[test]
-    fn slow_commit_does_not_lock_unrelated_stanzas() {
+    #[tokio::test]
+    async fn slow_commit_does_not_lock_unrelated_stanzas() {
         let retention = Arc::new(InboundRetention::default());
         let first = item("first", "first");
         let second = item("second", "second");
         for item in [&first, &second] {
-            assert!(retention.begin(&item.info, retention.admit(100)));
+            assert!(retention.begin(&item.info, retention.admit(100)).await);
             retention.stage(std::slice::from_ref(item), false).unwrap();
             retention.seal(&item.info, false);
         }
@@ -516,5 +551,46 @@ mod tests {
         drop(independent);
         assert_eq!(retention.stats(), (1, 100));
         drop(stalled);
+    }
+    #[tokio::test]
+    async fn producer_waits_until_prior_commit_succeeds_or_is_cancelled() {
+        use futures::FutureExt;
+        for completed in [false, true] {
+            let retention = Arc::new(InboundRetention::default());
+            let first = item("same-identity", "first");
+            let second = item("same-identity", "second");
+            assert!(retention.begin(&first.info, retention.admit(100)).await);
+            retention
+                .stage(std::slice::from_ref(&first), false)
+                .unwrap();
+            let (items, _) = retention.seal(&first.info, false);
+            let mut commit = retention.commit(&items).unwrap();
+            let mut begin = Box::pin(retention.begin(&first.info, retention.admit(200)));
+            assert!(begin.as_mut().now_or_never().is_none());
+            assert_eq!(retention.stats(), (2, 300));
+            if completed {
+                commit.complete();
+            }
+            drop(commit);
+            assert_eq!(begin.await, completed);
+            retention.stage(&[second], false).unwrap();
+            let (items, _) = retention.seal(&first.info, false);
+            let bodies: Vec<_> = items
+                .iter()
+                .map(|item| item.message.conversation.as_deref().unwrap())
+                .collect();
+            assert_eq!(
+                bodies,
+                if completed {
+                    vec!["second"]
+                } else {
+                    vec!["first", "second"]
+                }
+            );
+            let mut commit = retention.commit(&items).unwrap();
+            commit.complete();
+            drop(commit);
+            assert_eq!(retention.stats(), (0, 0));
+        }
     }
 }
