@@ -10,6 +10,26 @@
         "test": "event_delivery"
       },
       {
+        "lanes": ["wasm"],
+        "mode": "test",
+        "features": ["wasm-execution"],
+        "test": "durability_probe",
+        "wasm_test": true
+      },
+      {
+        "lanes": ["wasm"],
+        "mode": "test",
+        "features": ["wasm-execution"],
+        "test": "sqlite_timer",
+        "wasm_test": true
+      },
+      {
+        "lanes": ["native", "msrv"],
+        "mode": "test",
+        "features": ["native-default", "contracts"],
+        "lib": true
+      },
+      {
         "lanes": [
           "native",
           "msrv"
