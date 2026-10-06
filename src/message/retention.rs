@@ -50,7 +50,7 @@ impl Drop for InboundAdmission {
 enum State {
     Collecting,
     Batched,
-    Committing,
+    Committing(u64),
     Retry,
     Scheduled,
 }
@@ -166,7 +166,7 @@ impl InboundRetention {
         self.active.store(true, Ordering::Release);
         let mut stanzas = lock(&self.stanzas);
         if let Some(stanza) = stanzas.get_mut(&key(info))
-            && stanza.state == State::Committing
+            && matches!(stanza.state, State::Committing(_))
         {
             let (wake, wait) = futures::channel::oneshot::channel();
             stanza.commit_waiters.push(wake);
@@ -252,7 +252,7 @@ impl InboundRetention {
     pub(crate) fn replay_items(&self, info: &MessageInfo) -> Option<Arc<[InboundMessage]>> {
         let stanzas = lock(&self.stanzas);
         let stanza = stanzas.get(&key(info))?;
-        (!matches!(stanza.state, State::Collecting | State::Committing))
+        (!matches!(stanza.state, State::Collecting | State::Committing(_)))
             .then(|| stanza.items.clone().into())
     }
     pub(crate) fn is_collecting(&self, info: &MessageInfo) -> bool {
@@ -293,15 +293,23 @@ impl InboundRetention {
     pub(crate) fn batched(&self, items: &[InboundMessage], owner: Option<&RetentionCommit>) {
         let mut stanzas = lock(&self.stanzas);
         for item in items {
-            if let Some(stanza) = stanzas.get_mut(&key(&item.info))
-                && stanza.state != State::Collecting
-                && (stanza.state != State::Committing
-                    || owner.is_some_and(|owner| owner.owns(&item.info)))
-            {
-                // Only the owning commit can restore Committing to Batched.
-                // An older refused snapshot can race a newer producer's hook.
-                stanza.state = State::Batched;
+            let key = key(&item.info);
+            let Some(stanza) = stanzas.get_mut(&key) else {
+                continue;
+            };
+            match stanza.state {
+                State::Collecting => continue,
+                State::Committing(_) => {
+                    if !owner.is_some_and(|owner| owner.owns_stanza(&key, stanza)) {
+                        continue;
+                    }
+                    // Publishing the restored stanza relinquishes this commit.
+                    // A later Drop/complete must not affect a successor owner.
+                    stanza.commit_waiters.clear();
+                }
+                _ => {}
             }
+            stanza.state = State::Batched;
         }
     }
     pub(crate) fn commit(self: &Arc<Self>, items: &[InboundMessage]) -> Option<RetentionCommit> {
@@ -309,6 +317,7 @@ impl InboundRetention {
             return Some(RetentionCommit {
                 retention: Arc::clone(self),
                 keys: Vec::new(),
+                id: 0,
                 complete: false,
                 _admissions: Vec::new(),
             });
@@ -321,14 +330,17 @@ impl InboundRetention {
                 continue;
             }
             if let Some(stanza) = stanzas.get(&key) {
-                if matches!(stanza.state, State::Committing | State::Collecting) {
+                if matches!(stanza.state, State::Committing(_) | State::Collecting) {
                     return None;
                 }
                 keys.push(key);
             }
         }
+        // A restored entry can be committed again without a new producer.
+        // Give each acquisition its own authority over Drop and completion.
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         for key in &keys {
-            stanzas.get_mut(key).expect("key checked under lock").state = State::Committing;
+            stanzas.get_mut(key).expect("key checked under lock").state = State::Committing(id);
         }
         let admissions = keys
             .iter()
@@ -337,6 +349,7 @@ impl InboundRetention {
         Some(RetentionCommit {
             retention: Arc::clone(self),
             keys,
+            id,
             complete: false,
             _admissions: admissions,
         })
@@ -428,12 +441,19 @@ impl Drop for RetryAttempt {
 pub(crate) struct RetentionCommit {
     retention: Arc<InboundRetention>,
     keys: Vec<Key>,
+    id: u64,
     complete: bool,
     _admissions: Vec<Arc<InboundAdmission>>,
 }
 impl RetentionCommit {
+    fn owns_stanza(&self, key: &Key, stanza: &Stanza) -> bool {
+        stanza.state == State::Committing(self.id) && self.keys.contains(key)
+    }
     pub(crate) fn owns(&self, info: &MessageInfo) -> bool {
-        self.keys.contains(&key(info))
+        let key = key(info);
+        lock(&self.retention.stanzas)
+            .get(&key)
+            .is_some_and(|stanza| self.owns_stanza(&key, stanza))
     }
     pub(crate) fn canonical_items(&self, items: Arc<[InboundMessage]>) -> Arc<[InboundMessage]> {
         if self.keys.is_empty() {
@@ -444,9 +464,11 @@ impl RetentionCommit {
         let mut canonical = Vec::new();
         for item in items.iter() {
             let key = key(&item.info);
-            if self.keys.contains(&key) {
+            if let Some(stanza) = stanzas.get(&key)
+                && self.owns_stanza(&key, stanza)
+            {
                 if emitted.insert(key.clone()) {
-                    canonical.extend_from_slice(&stanzas[&key].items);
+                    canonical.extend_from_slice(&stanza.items);
                 }
             } else {
                 canonical.push(item.clone());
@@ -458,7 +480,11 @@ impl RetentionCommit {
         let stanzas = lock(&self.retention.stanzas);
         self.keys
             .iter()
-            .filter_map(|key| stanzas.get(key))
+            .filter_map(|key| {
+                stanzas
+                    .get(key)
+                    .filter(|stanza| self.owns_stanza(key, stanza))
+            })
             .flat_map(|stanza| stanza.pending_keys.iter().cloned())
             .collect()
     }
@@ -469,6 +495,7 @@ impl RetentionCommit {
         let mut stanzas = lock(&self.retention.stanzas);
         for key in &self.keys {
             if let Some(stanza) = stanzas.get_mut(key)
+                && self.owns_stanza(key, stanza)
                 && let Some(ticket) = stanza.ticket.take()
             {
                 ticket.mark_durable();
@@ -477,15 +504,18 @@ impl RetentionCommit {
     }
     pub(crate) fn complete(&mut self) {
         self.complete = true;
-        if self.keys.is_empty() {
-            return;
-        }
-        self.durable();
         let mut stanzas = lock(&self.retention.stanzas);
         for key in &self.keys {
-            stanzas.remove(key);
+            if stanzas
+                .get(key)
+                .is_some_and(|stanza| self.owns_stanza(key, stanza))
+            {
+                let mut stanza = stanzas.remove(key).expect("owner checked under lock");
+                if let Some(ticket) = stanza.ticket.take() {
+                    ticket.mark_durable();
+                }
+            }
         }
-        self.complete = true;
     }
 }
 impl Drop for RetentionCommit {
@@ -495,12 +525,10 @@ impl Drop for RetentionCommit {
         }
         let mut stanzas = lock(&self.retention.stanzas);
         for key in &self.keys {
-            if let Some(stanza) = stanzas.get_mut(key) {
-                // A cancelled drain first restores its batch. Keep that
-                // state; otherwise the resident retry owns the next attempt.
-                if stanza.state == State::Committing {
-                    stanza.state = State::Retry;
-                }
+            if let Some(stanza) = stanzas.get_mut(key)
+                && self.owns_stanza(key, stanza)
+            {
+                stanza.state = State::Retry;
                 stanza.commit_waiters.clear();
             }
         }
@@ -822,10 +850,25 @@ mod tests {
         let retention = Arc::new(InboundRetention::default());
         let first = item("owner-handoff", "A");
         retention.begin(&first.info, retention.admit(100)).await;
-        retention.stage(std::slice::from_ref(&first), true).unwrap();
+        let Some(InboundCommitState::Deferred(Some(ticket))) =
+            retention.stage(std::slice::from_ref(&first), true)
+        else {
+            panic!("tracked stanza must retain its ticket")
+        };
         let (items, _) = retention.seal(&first.info, true);
         let mut old = retention.commit(&items).unwrap();
+        let mut admission = None;
+        let waiting_old = retention
+            .try_begin(&first.info, &mut admission)
+            .unwrap_err();
         retention.batched(&items, Some(&old));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), waiting_old)
+                .await
+                .unwrap()
+                .is_err(),
+            "restoration must wake the relinquished owner's waiters"
+        );
         let new = retention.commit(&items).unwrap();
         let entered = Arc::new(tokio::sync::Notify::new());
         let task = tokio::spawn({
@@ -838,6 +881,15 @@ mod tests {
         });
         entered.notified().await;
         assert!(retention.commit(&items).is_none());
+        let mut admission = None;
+        let mut waiting = Box::pin(
+            retention
+                .try_begin(&first.info, &mut admission)
+                .unwrap_err(),
+        );
+        assert!(futures::poll!(waiting.as_mut()).is_pending());
+        old.durable();
+        assert_eq!(ticket.state(), InboundCommitTicketState::Pending);
         if complete_old {
             old.complete();
         }
@@ -847,11 +899,15 @@ mod tests {
             "a restored old owner must not release its successor"
         );
         assert_eq!(retention.stats(), (1, 100));
+        assert_eq!(ticket.state(), InboundCommitTicketState::Pending);
+        assert!(futures::poll!(waiting.as_mut()).is_pending());
         task.abort(); // Cancellation must release only this owner for recovery.
         assert!(task.await.unwrap_err().is_cancelled());
+        assert!(waiting.await.is_err());
         let mut retry = retention.commit(&items).unwrap();
         retry.complete();
         drop(retry);
+        assert_eq!(ticket.state(), InboundCommitTicketState::Durable);
         assert_eq!(retention.stats(), (0, 0));
     }
     #[tokio::test]

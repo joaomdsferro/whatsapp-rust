@@ -94,6 +94,16 @@ pub(super) fn extend_pending_record(
     Ok(Some(encode_pending_parts(&merged)))
 }
 
+fn is_subsequence(sequence: &[DispatchFingerprint], candidate: &[DispatchFingerprint]) -> bool {
+    let mut remaining = sequence;
+    for fingerprint in candidate {
+        if remaining.first() == Some(fingerprint) {
+            remaining = &remaining[1..];
+        }
+    }
+    remaining.is_empty()
+}
+
 pub(super) struct PendingReplay {
     pub(super) items: Vec<InboundMessage>,
     pub(super) keys: Vec<(String, String, String)>,
@@ -132,13 +142,14 @@ impl Client {
                         .parse::<Jid>()
                         .is_ok_and(|stored| stored.to_non_ad() == info.source.sender.to_non_ad())
         });
-        // Prefer the exact row so extending it preserves its original order.
+        // Prefer the exact spelling when recorded sequences are equivalent.
         rows.sort_by(|a, b| (a.0 != sender, &a.0).cmp(&(b.0 != sender, &b.0)));
         let mut replay = PendingReplay {
             items: Vec::new(),
             keys: Vec::new(),
         };
         let mut sequences = Vec::new();
+        let mut candidates = Vec::new();
         let mut scratch = Vec::new();
         for (stored_sender, bytes) in rows {
             let items: Vec<_> = decode_pending_parts(&bytes)?
@@ -156,25 +167,33 @@ impl Client {
                     .map(|item| MessageDispatch::fingerprint_into(&item.message, &mut scratch))
                     .collect::<Vec<_>>(),
             );
-            retention::merge_parts(&mut replay.items, items);
+            candidates.push(items);
             replay
                 .keys
                 .push((chat.clone(), stored_sender, info.id.to_string()));
         }
-        let canonical: Vec<_> = replay
-            .items
-            .iter()
-            .map(|item| MessageDispatch::fingerprint_into(&item.message, &mut scratch))
-            .collect();
-        for sequence in sequences {
-            let mut remaining = sequence.as_slice();
-            for fingerprint in &canonical {
-                if remaining.first() == Some(fingerprint) {
-                    remaining = &remaining[1..];
-                }
+        // Prefer an already-recorded sequence containing every row. An exact
+        // alias can be only a suffix: [B] must not make stored [A,B] become [B,A].
+        // Compare occurrences so [A,A,B] still contains two copies of A.
+        if let Some(complete) = sequences.iter().position(|candidate| {
+            sequences
+                .iter()
+                .all(|sequence| is_subsequence(sequence, candidate))
+        }) {
+            replay.items = candidates.swap_remove(complete);
+        } else {
+            for items in candidates {
+                retention::merge_parts(&mut replay.items, items);
             }
+            let canonical: Vec<_> = replay
+                .items
+                .iter()
+                .map(|item| MessageDispatch::fingerprint_into(&item.message, &mut scratch))
+                .collect();
             anyhow::ensure!(
-                remaining.is_empty(),
+                sequences
+                    .iter()
+                    .all(|sequence| is_subsequence(sequence, &canonical)),
                 "conflicting pending-inbound part order across sender keys"
             );
         }
