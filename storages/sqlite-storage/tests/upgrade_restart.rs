@@ -74,10 +74,14 @@ fn keypair_bytes(pair: &KeyPair) -> Vec<u8> {
 
 struct Seed {
     identity: Vec<u8>,
+    noise: Vec<u8>,
+    signed_pre_key: Vec<u8>,
+    registration_id: u32,
+    marker: u8,
     session: Vec<u8>,
 }
 
-fn seed_baseline(fixture: &Fixture) -> Seed {
+fn seed_baseline(fixture: &Fixture) -> Vec<Seed> {
     let mut conn = SqliteConnection::establish(fixture.url()).unwrap();
     let mut migrations = conn.pending_migrations(MIGRATIONS).unwrap();
     migrations.retain(|m| m.name().version().to_string().as_str() <= BASELINE_LAST);
@@ -86,21 +90,26 @@ fn seed_baseline(fixture: &Fixture) -> Seed {
     assert_eq!(conn.applied_migrations().unwrap().len(), 23);
 
     let mut rng = rand::rngs::StdRng::seed_from_u64(0x00A1_2070);
-    let identity = KeyPair::generate(&mut rng);
-    let remote = KeyPair::generate(&mut rng);
-    let mut state = SessionState::new(
-        3,
-        &IdentityKey::new(identity.public_key),
-        &IdentityKey::new(remote.public_key),
-        &RootKey::new([7; 32]),
-        &KeyPair::generate(&mut rng).public_key,
-    );
-    state.set_sender_chain(&KeyPair::generate(&mut rng), &ChainKey::new([11; 32], 4));
-    let session = SessionRecord::new(state).serialize().unwrap();
-    let identity = keypair_bytes(&identity);
     let signing = KeyPair::generate(&mut rng);
+    let mut seeds = Vec::new();
 
     for device_id in [1, 2] {
+        let marker = device_id as u8;
+        let registration_id = 1234 + device_id as u32;
+        let identity = KeyPair::generate(&mut rng);
+        let noise = keypair_bytes(&KeyPair::generate(&mut rng));
+        let signed_pre_key = keypair_bytes(&KeyPair::generate(&mut rng));
+        let remote = KeyPair::generate(&mut rng);
+        let mut state = SessionState::new(
+            3,
+            &IdentityKey::new(identity.public_key),
+            &IdentityKey::new(remote.public_key),
+            &RootKey::new([7; 32]),
+            &KeyPair::generate(&mut rng).public_key,
+        );
+        state.set_sender_chain(&KeyPair::generate(&mut rng), &ChainKey::new([11; 32], 4));
+        let session = SessionRecord::new(state).serialize().unwrap();
+        let identity = keypair_bytes(&identity);
         let mut sender_key = SenderKeyRecord::new_empty();
         sender_key
             .add_sender_key_state(
@@ -118,11 +127,12 @@ fn seed_baseline(fixture: &Fixture) -> Seed {
             .bind::<Integer, _>(device_id)
             .execute(&mut conn)
             .unwrap();
-        diesel::sql_query("INSERT INTO device (id, lid, pn, registration_id, noise_key, identity_key, signed_pre_key, signed_pre_key_id, signed_pre_key_signature, adv_secret_key) VALUES (?, '10000000008001@lid', ?, 1234, ?, ?, ?, 8, ?, ?)")
+        diesel::sql_query("INSERT INTO device (id, lid, pn, registration_id, noise_key, identity_key, signed_pre_key, signed_pre_key_id, signed_pre_key_signature, adv_secret_key) VALUES (?, '10000000008001@lid', ?, ?, ?, ?, ?, 8, ?, ?)")
             .bind::<Integer, _>(device_id).bind::<Text, _>(OLD_JID)
-            .bind::<Binary, _>(&identity).bind::<Binary, _>(&identity)
-            .bind::<Binary, _>(&identity).bind::<Binary, _>(vec![9u8; 64])
-            .bind::<Binary, _>(vec![10u8; 32]).execute(&mut conn).unwrap();
+            .bind::<Integer, _>(registration_id as i32)
+            .bind::<Binary, _>(&noise).bind::<Binary, _>(&identity)
+            .bind::<Binary, _>(&signed_pre_key).bind::<Binary, _>(vec![marker; 64])
+            .bind::<Binary, _>(vec![marker + 10; 32]).execute(&mut conn).unwrap();
         diesel::sql_query("INSERT INTO identities (address, key, device_id) VALUES (?, ?, ?)")
             .bind::<Text, _>(SIGNAL_ADDRESS)
             .bind::<Binary, _>(remote.public_key.public_key_bytes())
@@ -176,22 +186,31 @@ fn seed_baseline(fixture: &Fixture) -> Seed {
         .bind::<Integer, _>(device_id)
         .execute(&mut conn)
         .unwrap();
+        seeds.push(Seed {
+            identity,
+            noise,
+            signed_pre_key,
+            registration_id,
+            marker,
+            session,
+        });
     }
     conn.batch_execute("INSERT INTO msg_secrets (chat, sender, msg_id, secret, device_id, created_at, expires_at, message_ts) VALUES ('15550008001@c.us', '15550008001@c.us', 'secret', zeroblob(32), 1, 123, 0, 1700000000)").unwrap();
-    Seed { identity, session }
+    seeds
 }
 
-async fn verify(db: &SqliteDatabase, seed: &Seed) {
-    for device_id in [1, 2] {
+async fn verify(db: &SqliteDatabase, seeds: &[Seed]) {
+    for (index, seed) in seeds.iter().enumerate() {
+        let device_id = index as i32 + 1;
         let store = db.store(device_id);
         let device = store.load().await.unwrap().expect("existing account");
-        assert_eq!(device.registration_id, 1234);
+        assert_eq!(device.registration_id, seed.registration_id);
         assert_eq!(keypair_bytes(&device.identity_key), seed.identity);
-        assert_eq!(keypair_bytes(&device.noise_key), seed.identity);
-        assert_eq!(keypair_bytes(&device.signed_pre_key), seed.identity);
+        assert_eq!(keypair_bytes(&device.noise_key), seed.noise);
+        assert_eq!(keypair_bytes(&device.signed_pre_key), seed.signed_pre_key);
         assert_eq!(device.signed_pre_key_id, 8);
-        assert_eq!(device.signed_pre_key_signature, [9; 64]);
-        assert_eq!(device.adv_secret_key, [10; 32]);
+        assert_eq!(device.signed_pre_key_signature, [seed.marker; 64]);
+        assert_eq!(device.adv_secret_key, [seed.marker + 10; 32]);
         assert_eq!(device.pn.unwrap().to_string(), JID);
         assert_eq!(
             store
