@@ -817,10 +817,6 @@ impl Client {
     /// them, losing content with nothing left to redeliver it. Comparing the
     /// message keeps them and costs a structural compare only where identities
     /// actually collide, which is the rare case this whole function exists for.
-    #[cfg(test)]
-    fn dedup_batch_by_message(&self, items: Arc<[InboundMessage]>) -> Arc<[InboundMessage]> {
-        self.dedup_batch_with_retention(items, None)
-    }
     fn dedup_batch_with_retention(
         &self,
         items: Arc<[InboundMessage]>,
