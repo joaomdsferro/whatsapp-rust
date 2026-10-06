@@ -398,12 +398,17 @@ pub type UploadBody = Box<dyn std::io::Read + Send>;
 
 /// Trait for executing HTTP requests in a runtime-agnostic way.
 ///
-/// A completed exchange returns `Ok` with its status and body, including 4xx/5xx.
+/// A received HTTP response returns `Ok` with its status, including 4xx/5xx.
 /// Implementations must not turn an HTTP status into an opaque error. The SDK
 /// decides whether to retry according to the operation being performed.
-/// `Err` reports failures to complete the exchange, such as DNS, connect, TLS,
-/// timeout, body read failures or exceeded body limits. For streaming responses,
-/// subsequent body read failures are returned by the reader.
+/// DNS, connect, TLS and request timeout failures return `Err`.
+///
+/// Successful buffered responses must contain the complete body; body read
+/// failures or exceeded body limits return `Err`. For non-success responses,
+/// hosts may bound the diagnostic body and keep partial bytes after a read
+/// failure, preserving the status in `Ok`. Callers must not assume an error
+/// body is complete. The bundled ureq host uses this bounded, best-effort
+/// behavior. For streaming responses, body read failures come from the reader.
 ///
 /// Some HTTP libraries treat non-success statuses as errors by default; hosts
 /// must disable that behavior, for example with ureq's `http_status_as_error`.
