@@ -4,6 +4,12 @@
     "locked": true,
     "commands": [
       {
+        "lanes": ["native", "msrv"],
+        "mode": "test",
+        "features": ["native-default", "contracts"],
+        "lib": true
+      },
+      {
         "lanes": [
           "native",
           "msrv"

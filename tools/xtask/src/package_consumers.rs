@@ -197,11 +197,43 @@ pub fn run(root: &Path, lane: Lane, toolchain: &str) -> Result<u8> {
         "package qualification must run outside the checkout"
     );
     // Keep the owner alive until the consumers finish.
-    run_staged(root, &stage, lane, toolchain, &packages, &order)
+    run_staged(root, root, &stage, lane, toolchain, &packages, &order)
+}
+
+pub fn frozen(root: &Path, baseline: &str, lane: Lane, toolchain: &str) -> Result<u8> {
+    let source = tempfile::tempdir()?;
+    let archive = capture(
+        Command::new("git")
+            .args([
+                "archive",
+                "--format=tar",
+                baseline,
+                "tests",
+                "tools/xtask/consumers.json",
+            ])
+            .current_dir(root),
+    )?;
+    tar::Archive::new(archive.stdout.as_slice()).unpack(source.path())?;
+    let meta = metadata(root)?;
+    let packages = published(&meta)?;
+    let order = publication_order(&meta, &packages)?;
+    let stage = tempfile::Builder::new()
+        .prefix("whatsapp-frozen-consumers-")
+        .tempdir()?;
+    run_staged(
+        root,
+        source.path(),
+        stage.path(),
+        lane,
+        toolchain,
+        &packages,
+        &order,
+    )
 }
 
 fn run_staged(
     root: &Path,
+    consumer_source: &Path,
     stage: &Path,
     lane: Lane,
     toolchain: &str,
@@ -268,11 +300,11 @@ fn run_staged(
         );
         println!("qualified source: {}", package.directory.display());
     }
-    copy_tree(&root.join("tests"), &stage.join("tests"))?;
+    copy_tree(&consumer_source.join("tests"), &stage.join("tests"))?;
     let registry = "tools/xtask/consumers.json";
-    let consumers: Value = serde_json::from_slice(&std::fs::read(root.join(registry))?)?;
+    let consumers: Value = serde_json::from_slice(&std::fs::read(consumer_source.join(registry))?)?;
     std::fs::create_dir_all(stage.join("tools/xtask"))?;
-    std::fs::copy(root.join(registry), stage.join(registry))?;
+    std::fs::copy(consumer_source.join(registry), stage.join(registry))?;
     std::fs::create_dir_all(stage.join(".cargo"))?;
     let config = toml::Table::from_iter([(
         "patch".into(),

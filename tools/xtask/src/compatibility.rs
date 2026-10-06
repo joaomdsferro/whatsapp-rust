@@ -1,0 +1,357 @@
+//! Preparation is explicit; only an approved immutable baseline can authorize release.
+use crate::consumers::{self, Lane};
+use anyhow::{Context, Result, ensure};
+use serde::Deserialize;
+use serde_json::Value;
+use std::{collections::BTreeSet, path::Path, process::Command};
+use xtask_support::{capture, run as execute};
+
+const POLICY: &str = "tools/xtask/compatibility.json";
+
+pub fn controls(root: &Path, lane: Lane, toolchain: &str) -> Result<()> {
+    ensure!(
+        lane != Lane::Msrv,
+        "run mutation controls on native and WASM; MSRV runs the unmodified hosts"
+    );
+    let stage = tempfile::Builder::new()
+        .prefix("whatsapp-compatibility-control-")
+        .tempdir()?;
+    let archive = capture(
+        Command::new("git")
+            .args(["archive", "--format=tar", "HEAD"])
+            .current_dir(root),
+    )?;
+    tar::Archive::new(archive.stdout.as_slice()).unpack(stage.path())?;
+    let check = || -> Result<std::process::Output> {
+        let mut command = Command::new("cargo");
+        command
+            .arg(format!("+{toolchain}"))
+            .args([
+                "check",
+                "--locked",
+                "--manifest-path",
+                "tests/api-consumer/Cargo.toml",
+                "--lib",
+                "--features",
+                "sdk",
+                "--message-format=json",
+            ])
+            .current_dir(stage.path())
+            .env_remove("CARGO_ENCODED_RUSTFLAGS")
+            .env("CARGO_TARGET_DIR", stage.path().join("target"))
+            .env("CARGO_BUILD_JOBS", "1")
+            .env("RUSTFLAGS", "");
+        if lane == Lane::Wasm {
+            command
+                .args(["--target", "wasm32-unknown-unknown"])
+                .env("RUSTFLAGS", "--cfg getrandom_backend=\"wasm_js\"");
+        }
+        Ok(command.output()?)
+    };
+    let positive = check()?;
+    ensure!(
+        positive.status.success(),
+        "unmodified control must compile first: {}",
+        String::from_utf8_lossy(&positive.stderr)
+    );
+    for (file, before, after, code, needle) in [
+        (
+            "src/client/builder.rs",
+            "pub fn with_enc_handler<H>",
+            "pub(crate) fn with_enc_handler<H>",
+            "E0624",
+            "with_enc_handler",
+        ),
+        (
+            "src/types/enc_handler.rs",
+            "pub trait EncHandler: wacore::sync_marker::MaybeSendSync {",
+            "pub trait EncHandler: wacore::sync_marker::MaybeSendSync {\nfn compatibility_required_method(&self);",
+            "E0046",
+            "compatibility_required_method",
+        ),
+    ] {
+        let path = stage.path().join(file);
+        let original = std::fs::read_to_string(&path)?;
+        ensure!(
+            original.matches(before).count() == 1,
+            "mutation anchor changed: {file}; update the control explicitly"
+        );
+        std::fs::write(&path, original.replace(before, after))?;
+        let result = check()?;
+        std::fs::write(path, original)?;
+        verify_control(&result, code, needle)?;
+        println!("{lane:?} control caught {needle} ({code}) in the external host");
+    }
+    Ok(())
+}
+
+fn verify_control(output: &std::process::Output, code: &str, needle: &str) -> Result<()> {
+    ensure!(
+        !output.status.success(),
+        "compatibility mutation unexpectedly compiled: {needle}"
+    );
+    let errors = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|v| v["reason"] == "compiler-message" && v["message"]["level"] == "error")
+        .collect::<Vec<_>>();
+    ensure!(
+        !errors.is_empty(),
+        "mutation failed without compiler evidence: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for error in errors {
+        let diagnostic = &error["message"];
+        ensure!(
+            diagnostic["code"]["code"] == code
+                && diagnostic["rendered"]
+                    .as_str()
+                    .is_some_and(|s| s.contains(needle))
+                && diagnostic["spans"]
+                    .as_array()
+                    .is_some_and(|spans| spans.iter().any(|s| s["is_primary"] == true
+                        && s["file_name"]
+                            .as_str()
+                            .is_some_and(|p| p.ends_with("src/encapsulation/mod.rs")))),
+            "mutation failed for an unrelated reason: {diagnostic}"
+        );
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Policy {
+    phase: Phase,
+    baseline: Option<String>,
+    profiles: Vec<Profile>,
+}
+#[derive(Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+enum Phase {
+    Preparing,
+    Frozen,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Profile {
+    package: String,
+    name: String,
+    defaults: bool,
+    features: Vec<String>,
+    wasm: bool,
+}
+fn sha(value: &str) -> bool {
+    value.len() == 40
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+impl Policy {
+    fn validate(&self, meta: &Value, release: bool) -> Result<()> {
+        ensure!(
+            self.phase == Phase::Frozen || self.baseline.is_none(),
+            "preparation cannot masquerade as a frozen baseline"
+        );
+        ensure!(
+            self.phase != Phase::Frozen || self.baseline.as_deref().is_some_and(sha),
+            "frozen policy requires a full immutable commit SHA"
+        );
+        ensure!(
+            !release || self.phase == Phase::Frozen,
+            "release blocked: approve production profiles and freeze the RC baseline after API changes"
+        );
+        let packages = meta["packages"].as_array().context("packages")?;
+        let published = packages
+            .iter()
+            .filter(|p| !p["publish"].as_array().is_some_and(Vec::is_empty))
+            .map(|p| p["name"].as_str().context("package name"))
+            .collect::<Result<BTreeSet<_>>>()?;
+        let selected = self
+            .profiles
+            .iter()
+            .map(|p| p.package.as_str())
+            .collect::<BTreeSet<_>>();
+        ensure!(
+            selected == published,
+            "compatibility profiles must cover exactly the published graph; selected {selected:?}, published {published:?}"
+        );
+        let mut keys = BTreeSet::new();
+        for profile in &self.profiles {
+            ensure!(
+                keys.insert((&profile.package, &profile.name)),
+                "duplicate compatibility profile"
+            );
+            let package = packages
+                .iter()
+                .find(|p| p["name"] == profile.package)
+                .context("unknown profile package")?;
+            for feature in &profile.features {
+                ensure!(
+                    package["features"].get(feature).is_some(),
+                    "{}/{} lost feature {feature}",
+                    profile.package,
+                    profile.name
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+fn semver_args(profile: &Profile, baseline: &str) -> Vec<String> {
+    let mut args = vec![
+        "semver-checks".into(),
+        "check-release".into(),
+        "--release-type".into(),
+        "patch".into(),
+        "--baseline-rev".into(),
+        baseline.into(),
+        "-p".into(),
+        profile.package.clone(),
+        if profile.defaults {
+            "--default-features"
+        } else {
+            "--only-explicit-features"
+        }
+        .into(),
+    ];
+    if !profile.features.is_empty() {
+        args.extend(["--features".into(), profile.features.join(",")]);
+    }
+    args
+}
+
+pub fn run(root: &Path, release: bool, lane: Lane, toolchain: &str) -> Result<u8> {
+    let policy: Policy = serde_json::from_slice(&std::fs::read(root.join(POLICY))?)?;
+    let meta: Value = serde_json::from_slice(
+        &capture(
+            Command::new("cargo")
+                .args(["metadata", "--no-deps", "--format-version", "1"])
+                .current_dir(root),
+        )?
+        .stdout,
+    )?;
+    policy.validate(&meta, release)?;
+    if let Some(baseline) = &policy.baseline {
+        let exact = capture(
+            Command::new("git")
+                .args(["rev-parse", &format!("{baseline}^{{commit}}")])
+                .current_dir(root),
+        )?;
+        ensure!(
+            String::from_utf8(exact.stdout)?.trim() == baseline,
+            "baseline commit mismatch"
+        );
+        execute(
+            Command::new("git")
+                .args(["merge-base", "--is-ancestor", baseline, "HEAD"])
+                .current_dir(root),
+        )?;
+        if lane == Lane::Native {
+            for profile in &policy.profiles {
+                // Proc-macro signatures do not establish expansion compatibility.
+                // Frozen downstream hosts below exercise the emitted implementations.
+                if profile.package == "wacore-derive" {
+                    continue;
+                }
+                println!(
+                    "compatibility {}/{} against {baseline}",
+                    profile.package, profile.name
+                );
+                execute(
+                    Command::new("cargo")
+                        .args(semver_args(profile, baseline))
+                        .current_dir(root),
+                )?;
+            }
+        }
+        return crate::package_consumers::frozen(root, baseline, lane, toolchain);
+    }
+    println!(
+        "API preparation: checking candidate profiles and current consumers; no RC compatibility claim or release authorization"
+    );
+    // Do not gate intentional pre-1.0 changes against the published 0.7.0 API.
+    // These checks remain required; tool/build failures are never swallowed.
+    for profile in &policy.profiles {
+        if lane == Lane::Wasm && !profile.wasm {
+            continue;
+        }
+        let mut command = Command::new("cargo");
+        command
+            .arg(format!("+{toolchain}"))
+            .args(["check", "--locked", "--lib", "-p", &profile.package])
+            .current_dir(root)
+            .env_remove("CARGO_ENCODED_RUSTFLAGS")
+            .env("RUSTFLAGS", "");
+        if !profile.defaults {
+            command.arg("--no-default-features");
+        }
+        let mut features = profile.features.clone();
+        if lane == Lane::Wasm {
+            command
+                .args(["--target", "wasm32-unknown-unknown"])
+                .env("RUSTFLAGS", "--cfg getrandom_backend=\"wasm_js\"");
+            if profile.package == "wacore" {
+                features.push("js".into());
+            }
+        }
+        if !features.is_empty() {
+            command.args(["--features", &features.join(",")]);
+        }
+        execute(&mut command)?;
+    }
+    consumers::run(
+        root,
+        consumers::Task::Run {
+            lane,
+            toolchain: Some(toolchain.into()),
+            manifest: None,
+            dry_run: false,
+        },
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn policy() -> Policy {
+        serde_json::from_str(r#"{"phase":"preparing","baseline":null,"profiles":[{"package":"sdk","name":"minimal","defaults":false,"features":["host"],"wasm":true}]}"#).unwrap()
+    }
+    fn metadata() -> Value {
+        serde_json::json!({"packages":[{"name":"sdk","features":{"host":[]},"publish":null}]})
+    }
+    #[test]
+    fn preparation_never_authorizes_release_or_fabricates_a_baseline() {
+        let mut policy = policy();
+        policy.validate(&metadata(), false).unwrap();
+        assert!(policy.validate(&metadata(), true).is_err());
+        policy.phase = Phase::Frozen;
+        assert!(policy.validate(&metadata(), true).is_err());
+        policy.baseline = Some("main".into());
+        assert!(policy.validate(&metadata(), true).is_err());
+        policy.baseline = Some("a".repeat(40));
+        policy.validate(&metadata(), true).unwrap();
+    }
+    #[test]
+    fn rejects_missing_sdk_adapter_or_feature_contract() {
+        let policy = policy();
+        let mut meta = metadata();
+        meta["packages"][0]["features"] = serde_json::json!({});
+        assert!(policy.validate(&meta, false).is_err());
+        meta = metadata();
+        meta["packages"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"name":"adapter","publish":null}));
+        assert!(policy.validate(&meta, false).is_err());
+    }
+    #[test]
+    fn version_bumps_cannot_disable_break_detection_and_features_are_explicit() {
+        let policy = policy();
+        let args = semver_args(&policy.profiles[0], &"a".repeat(40));
+        assert!(args.windows(2).any(|w| w == ["--release-type", "patch"]));
+        assert!(args.contains(&"--only-explicit-features".into()));
+        assert!(!args.contains(&"--all-features".into()));
+    }
+}

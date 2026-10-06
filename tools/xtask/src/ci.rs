@@ -8,6 +8,22 @@ use xtask_support::{capture, write};
 
 #[derive(Subcommand)]
 pub enum Task {
+    /// Prove SDK and host-contract removals fail downstream compilation.
+    CompatibilityControls {
+        #[arg(long, value_enum)]
+        lane: super::consumers::Lane,
+        #[arg(long)]
+        toolchain: String,
+    },
+    /// Check declared compatibility profiles and the approved immutable baseline.
+    Compatibility {
+        #[arg(long)]
+        release: bool,
+        #[arg(long, value_enum)]
+        lane: super::consumers::Lane,
+        #[arg(long)]
+        toolchain: String,
+    },
     /// Qualify existing consumers against packaged crates outside this checkout.
     PackageConsumers {
         #[arg(long, value_enum)]
@@ -189,6 +205,17 @@ fn timed_report(
 pub fn run(root: &Path, task: Task) -> Result<u8> {
     match task {
         Task::Consumers { task } => return super::consumers::run(root, task),
+        Task::CompatibilityControls { lane, toolchain } => {
+            super::compatibility::controls(root, lane, &toolchain)?;
+            return Ok(0);
+        }
+        Task::Compatibility {
+            release,
+            lane,
+            toolchain,
+        } => {
+            return super::compatibility::run(root, release, lane, &toolchain);
+        }
         Task::PackageConsumers { lane, toolchain } => {
             return super::package_consumers::run(root, lane, &toolchain);
         }
