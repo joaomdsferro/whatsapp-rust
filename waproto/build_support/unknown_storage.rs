@@ -1,13 +1,24 @@
-use ::core::mem::ManuallyDrop;
-
-/// Internal owner with one shared destruction path for unknown wire records.
+/// Internal owner that allocates its collection header only for future fields.
 #[repr(transparent)]
-#[derive(Default, PartialEq, Hash)]
-pub struct Storage(ManuallyDrop<::buffa::UnknownFields>);
+#[derive(Default)]
+pub struct Storage(Option<Box<::buffa::UnknownFields>>);
+
+static EMPTY: ::buffa::UnknownFields = ::buffa::UnknownFields::new();
+
+impl PartialEq for Storage {
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+impl ::core::hash::Hash for Storage {
+    fn hash<H: ::core::hash::Hasher>(&self, state: &mut H) {
+        ::core::hash::Hash::hash(&**self, state);
+    }
+}
 
 impl ::core::fmt::Debug for Storage {
     fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
-        ::core::fmt::Debug::fmt(&*self.0, f)
+        ::core::fmt::Debug::fmt(&**self, f)
     }
 }
 impl Clone for Storage {
@@ -29,52 +40,50 @@ fn clone_nonempty(value: &::buffa::UnknownFields) -> ::buffa::UnknownFields {
 impl Drop for Storage {
     #[inline]
     fn drop(&mut self) {
-        // SAFETY: Storage owns this initialized value and does not expose the
-        // ManuallyDrop. Drop runs once; into_inner suppresses this destructor.
-        unsafe { drop_storage(&mut self.0) }
+        if let Some(value) = self.0.take() {
+            drop_storage(value);
+        }
     }
 }
+#[cold]
 #[inline(never)]
-unsafe fn drop_storage(value: &mut ManuallyDrop<::buffa::UnknownFields>) {
-    // SAFETY: caller transfers the sole responsibility for dropping value.
-    unsafe { ManuallyDrop::drop(value) }
+fn drop_storage(value: Box<::buffa::UnknownFields>) {
+    drop(value);
 }
 impl ::core::ops::Deref for Storage {
     type Target = ::buffa::UnknownFields;
     #[inline]
     fn deref(&self) -> &Self::Target {
-        &self.0
+        self.0.as_deref().unwrap_or(&EMPTY)
     }
 }
 impl ::core::ops::DerefMut for Storage {
     #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
+        self.0.get_or_insert_with(Box::default)
     }
 }
 impl From<::buffa::UnknownFields> for Storage {
     #[inline]
     fn from(value: ::buffa::UnknownFields) -> Self {
-        Self(ManuallyDrop::new(value))
+        Self((!value.is_empty()).then(|| Box::new(value)))
     }
 }
 impl From<Storage> for ::buffa::UnknownFields {
     #[inline]
     fn from(value: Storage) -> Self {
-        let mut value = ManuallyDrop::new(value);
-        // SAFETY: value is initialized; its outer destructor is suppressed,
-        // and this transfers its inner owner exactly once to the caller.
-        unsafe { ManuallyDrop::take(&mut value.0) }
+        let mut value = value;
+        value.0.take().map(|fields| *fields).unwrap_or_default()
     }
 }
 impl PartialEq<::buffa::UnknownFields> for Storage {
     fn eq(&self, other: &::buffa::UnknownFields) -> bool {
-        &*self.0 == other
+        &**self == other
     }
 }
 impl PartialEq<Storage> for ::buffa::UnknownFields {
     fn eq(&self, other: &Storage) -> bool {
-        self == &*other.0
+        self == &**other
     }
 }
 impl<'a> IntoIterator for &'a Storage {
@@ -100,8 +109,7 @@ impl Storage {
         buf: &mut impl ::buffa::bytes::Buf,
         ctx: ::buffa::DecodeContext<'_>,
     ) -> Result<(), ::buffa::DecodeError> {
-        self.0
-            .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
+        self.push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
         Ok(())
     }
     #[inline]
@@ -127,7 +135,7 @@ impl Storage {
     #[cold]
     #[inline(never)]
     pub fn push(&mut self, field: ::buffa::UnknownField) {
-        self.0.push(field);
+        self.0.get_or_insert_with(Box::default).push(field);
     }
 }
 #[cold]

@@ -19,14 +19,18 @@ fn future() -> UnknownFields {
 }
 
 #[test]
-fn storage_keeps_layout_and_owned_unknown_records() {
-    assert_eq!(size_of::<Storage>(), size_of::<UnknownFields>());
-    assert_eq!(align_of::<Storage>(), align_of::<UnknownFields>());
+fn storage_keeps_pointer_layout_and_owned_unknown_records() {
+    assert_eq!(size_of::<Storage>(), size_of::<usize>());
+    assert_eq!(align_of::<Storage>(), align_of::<usize>());
     let mut storage = Storage::from(future());
     let cloned = storage.clone();
     storage.clear();
     assert!(storage.is_empty());
     assert!(storage.clone().is_empty());
+    assert_eq!(storage, Storage::default());
+    let mut empty_mutated = Storage::default();
+    empty_mutated.retain(|_| true);
+    assert_eq!(empty_mutated, Storage::default());
     let restored = UnknownFields::from(cloned);
     assert_eq!(restored, future());
     let storage = Storage::from(restored);
