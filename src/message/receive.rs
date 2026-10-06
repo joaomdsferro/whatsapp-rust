@@ -504,6 +504,66 @@ impl Client {
             .await;
     }
 
+    // The optional replay read and collection setup have their own future;
+    // ordinary receives do not allocate it or carry its state through decrypt.
+    async fn begin_retained_message(
+        self: &Arc<Self>,
+        info: &Arc<MessageInfo>,
+        admission: Option<retention::InboundAdmission>,
+        lane_generation: u64,
+    ) -> Option<retention::RetentionCollection> {
+        let fresh = self
+            .inbound_commit_batch
+            .retention
+            .begin(info, admission)
+            .await;
+        let collection = self.inbound_commit_batch.retention.collection_guard(info);
+        if self.connection_generation.load(Ordering::Acquire) != lane_generation {
+            return None;
+        }
+        self.inbound_commit_batch.remove_retained_identity(info);
+        if fresh {
+            let backend = self.persistence_manager.backend();
+            match backend
+                .get_pending_inbound(
+                    &info.source.chat.to_string(),
+                    &info.source.sender.to_string(),
+                    &info.id,
+                )
+                .await
+            {
+                Ok(Some(bytes)) => match durability::decode_pending_parts(&bytes) {
+                    Ok(messages) => {
+                        let items: Vec<_> = messages
+                            .into_iter()
+                            .map(|message| {
+                                InboundMessage::builder()
+                                    .message(Arc::new(message))
+                                    .info(Arc::clone(info))
+                                    .build()
+                            })
+                            .collect();
+                        self.inbound_commit_batch.retention.seed_replay(items);
+                    }
+                    Err(error) => {
+                        log::error!(
+                            "Pending inbound record cannot be decoded; preserving it without decrypting another delivery: {error:?}"
+                        );
+                        return None;
+                    }
+                },
+                Ok(None) => {}
+                Err(error) => {
+                    log::warn!(
+                        "Pending inbound read failed before decrypt; withholding receipt: {error:?}"
+                    );
+                    return None;
+                }
+            }
+        }
+        Some(collection)
+    }
+
     /// Phase 2: acquire permit, decrypt payloads, flush. No node borrows.
     #[cfg_attr(
         feature = "tracing",
@@ -588,70 +648,31 @@ impl Client {
             return;
         }
 
-        let _collection;
-        if self.inbound_durability_hook().is_some() {
-            let fresh = self
-                .inbound_commit_batch
-                .retention
-                .begin(&info, admission)
-                .await;
-            _collection = Some(self.inbound_commit_batch.retention.collection_guard(&info));
-            if self.connection_generation.load(Ordering::Acquire) != lane_generation {
-                for payload in session_payloads
-                    .iter()
-                    .chain(&group_payloads)
-                    .chain(&bot_payloads)
-                {
-                    self.report_enc_decrypt_failure(
-                        &info,
-                        payload.enc_index,
-                        payload.enc_type.as_wire_str(),
-                        EncDecryptFailureReason::NotAttempted,
-                    );
-                }
-                return;
-            }
-            self.inbound_commit_batch.remove_retained_identity(&info);
-            if fresh {
-                let backend = self.persistence_manager.backend();
-                match backend
-                    .get_pending_inbound(
-                        &info.source.chat.to_string(),
-                        &info.source.sender.to_string(),
-                        &info.id,
-                    )
-                    .await
-                {
-                    Ok(Some(bytes)) => match durability::decode_pending_parts(&bytes) {
-                        Ok(messages) => {
-                            let items: Vec<_> = messages
-                                .into_iter()
-                                .map(|message| {
-                                    InboundMessage::builder()
-                                        .message(Arc::new(message))
-                                        .info(Arc::clone(&info))
-                                        .build()
-                                })
-                                .collect();
-                            self.inbound_commit_batch.retention.seed_replay(items);
-                        }
-                        Err(error) => {
-                            log::error!(
-                                "Pending inbound record cannot be decoded; preserving it without decrypting another delivery: {error:?}"
+        let _collection = if self.inbound_durability_hook().is_some() {
+            match Box::pin(self.begin_retained_message(&info, admission, lane_generation)).await {
+                Some(collection) => Some(collection),
+                None => {
+                    if self.connection_generation.load(Ordering::Acquire) != lane_generation {
+                        for payload in session_payloads
+                            .iter()
+                            .chain(&group_payloads)
+                            .chain(&bot_payloads)
+                        {
+                            self.report_enc_decrypt_failure(
+                                &info,
+                                payload.enc_index,
+                                payload.enc_type.as_wire_str(),
+                                EncDecryptFailureReason::NotAttempted,
                             );
-                            return;
                         }
-                    },
-                    Ok(None) => {}
-                    Err(error) => {
-                        log::warn!(
-                            "Pending inbound read failed before decrypt; withholding receipt: {error:?}"
-                        );
-                        return;
                     }
+                    return;
                 }
             }
-        }
+        } else {
+            drop(admission);
+            None
+        };
 
         // The guard restores partial plaintext on cancellation or an early
         // return; sealing transfers recovery ownership to the commit path.
