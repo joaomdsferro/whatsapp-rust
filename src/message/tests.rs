@@ -19952,3 +19952,6 @@ async fn suppressed_resend_replays_to_a_durability_hook() {
         "the replay is what delivers the message the failed commit owed the consumer"
     );
 }
+
+#[path = "tests/a09_reproduction.rs"]
+mod a09_reproduction;
