@@ -1271,11 +1271,10 @@ pub enum SignalMaintenanceError {
     /// A Signal primitive failed (e.g. signing the new signed pre-key).
     #[error("{0}")]
     Signal(#[from] wacore::libsignal::protocol::SignalProtocolError),
-    /// The inbound drain batch could not be committed, so the Signal cache was
-    /// left unflushed on purpose and the server redelivers those messages.
-    #[error(
-        "inbound drain batch commit failed; Signal cache left unflushed so the server redelivers"
-    )]
+    /// The inbound drain batch could not be committed, so its Signal cache
+    /// advances were deliberately left unflushed. This does not guarantee
+    /// another server delivery.
+    #[error("inbound drain batch commit failed; Signal cache left unflushed")]
     DrainCommitFailed,
     /// The client is going away while an inbound drain is active; flushing
     /// there would persist ratchet advances whose messages have no durable row.
@@ -2115,11 +2114,10 @@ pub struct Client {
     /// `OnceLock::get` (no lock) and no per-node guard acquisition.
     pub(crate) custom_enc_handlers: std::sync::OnceLock<HashMap<String, Arc<dyn EncHandler>>>,
 
-    /// Optional inbound durability hook. When set, the transport ack for a
-    /// decrypted user message is deferred until the hook commits it, converting
-    /// the consumer to at-least-once delivery. Set once at `Bot::build` and read
-    /// lock-free on the receive path. `None` (default) keeps the current
-    /// at-most-once behavior with zero overhead.
+    /// Consumer commit barrier for supported inbound delivery receipts.
+    /// Immutable after construction and read lock-free on the receive path.
+    /// `None` keeps the existing message-processing path; the trait documents
+    /// the conditional recovery contract when a hook is installed.
     pub(crate) inbound_durability_hook:
         std::sync::OnceLock<Arc<dyn crate::types::durability_hook::InboundDurabilityHook>>,
 

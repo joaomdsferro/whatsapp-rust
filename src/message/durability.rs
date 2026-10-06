@@ -110,7 +110,7 @@ impl Client {
     /// pending row, and consumers observe the message there.
     /// Usually its original batch never dispatched (the hook failed then); if
     /// it did (post-commit row cleanup failed AND the ack was lost), event
-    /// consumers see it twice — the documented at-least-once shape of
+    /// consumers can see it twice, so commits must tolerate duplicate
     /// `Event::Messages` with a hook registered. A plain ack is sent only for
     /// a genuine duplicate (no buffered copy). A read failure fails closed
     /// (no ack) so a transient storage error cannot drop a message that still
