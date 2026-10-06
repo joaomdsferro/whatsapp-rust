@@ -25,7 +25,9 @@ use waproto::whatsapp as wa;
 /// corresponding inbound delivery reaches the replay path, not scanned at startup.
 /// Group replay reads all original sender keys for that chat/id and filters the
 /// established device-less participant identity without merging PN and LID.
-/// Corrupt or conflicting matching rows fail closed. Only rows read for the
+/// If one recorded payload sequence contains all matching rows, replay reuses
+/// that sequence and its repeated parts. Corrupt or conflicting matching rows
+/// fail closed. Only rows read for the
 /// successful commit (and rows it wrote) are removed; unrelated participants,
 /// chats, message ids and backend devices are preserved.
 ///
