@@ -818,6 +818,50 @@ mod tests {
         drop(commit);
         assert_eq!(retention.stats(), (0, 0));
     }
+    async fn restored_owner_cannot_mutate_successor(complete_old: bool) {
+        let retention = Arc::new(InboundRetention::default());
+        let first = item("owner-handoff", "A");
+        retention.begin(&first.info, retention.admit(100)).await;
+        retention.stage(std::slice::from_ref(&first), true).unwrap();
+        let (items, _) = retention.seal(&first.info, true);
+        let mut old = retention.commit(&items).unwrap();
+        retention.batched(&items, Some(&old));
+        let new = retention.commit(&items).unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let task = tokio::spawn({
+            let entered = entered.clone();
+            async move {
+                let _new = new;
+                entered.notify_one();
+                futures::future::pending::<()>().await;
+            }
+        });
+        entered.notified().await;
+        assert!(retention.commit(&items).is_none());
+        if complete_old {
+            old.complete();
+        }
+        drop(old);
+        assert!(
+            retention.commit(&items).is_none(),
+            "a restored old owner must not release its successor"
+        );
+        assert_eq!(retention.stats(), (1, 100));
+        task.abort(); // Cancellation must release only this owner for recovery.
+        assert!(task.await.unwrap_err().is_cancelled());
+        let mut retry = retention.commit(&items).unwrap();
+        retry.complete();
+        drop(retry);
+        assert_eq!(retention.stats(), (0, 0));
+    }
+    #[tokio::test]
+    async fn restored_owner_drop_cannot_release_a_new_commit() {
+        restored_owner_cannot_mutate_successor(false).await;
+    }
+    #[tokio::test]
+    async fn restored_owner_complete_cannot_remove_a_new_commit() {
+        restored_owner_cannot_mutate_successor(true).await;
+    }
     #[tokio::test]
     async fn restoring_an_old_snapshot_does_not_seal_a_new_producer() {
         let retention = Arc::new(InboundRetention::default());
