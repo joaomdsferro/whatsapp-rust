@@ -363,6 +363,11 @@ uuid = { workspace = true, features = ["v4"] }
 wacore = { workspace = true, features = ["test-util"] }
 wacore-noise = { path = "./wacore/noise", features = ["test-util"] }
 
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+# Path-only so Cargo drops this local feature-unification edge when packaging.
+# A version would make it resolve a published copy of this same crate.
+whatsapp-rust = { path = ".", default-features = false, features = ["bench-harness"] }
+
 [lints]
 workspace = true
 
