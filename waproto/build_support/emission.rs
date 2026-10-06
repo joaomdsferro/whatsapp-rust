@@ -106,7 +106,9 @@ fn protect(attrs: &mut Vec<syn::Attribute>) {
     }
 }
 
-fn share_large_encoders(items: &mut [syn::Item]) {
+// Nested messages otherwise repeat sizeable codecs in their parents. Keep
+// the small-message case available for inlining and share larger codecs.
+fn share_large_codecs(items: &mut [syn::Item]) {
     let large: BTreeSet<_> = items
         .iter()
         .filter_map(|item| {
@@ -131,7 +133,7 @@ fn share_large_encoders(items: &mut [syn::Item]) {
         match item {
             syn::Item::Mod(module) => {
                 if let Some((_, items)) = &mut module.content {
-                    share_large_encoders(items);
+                    share_large_codecs(items);
                 }
             }
             syn::Item::Impl(item) => {
@@ -153,7 +155,9 @@ fn share_large_encoders(items: &mut [syn::Item]) {
                 }
                 for member in &mut item.items {
                     if let syn::ImplItem::Fn(method) = member
-                        && (method.sig.ident == "compute_size" || method.sig.ident == "write_to")
+                        && (method.sig.ident == "compute_size"
+                            || method.sig.ident == "write_to"
+                            || method.sig.ident == "merge_field")
                     {
                         method.attrs.retain(|attr| !attr.path().is_ident("inline"));
                         method.attrs.push(syn::parse_quote!(#[inline(never)]));
@@ -179,7 +183,7 @@ pub fn finish(out: &Path, package: &str) -> io::Result<BTreeSet<String>> {
         let mut file = syn::parse_file(&source).map_err(io::Error::other)?;
         Extensible { serde }.visit_file_mut(&mut file);
         if serde {
-            share_large_encoders(&mut file.items);
+            share_large_codecs(&mut file.items);
             ColdStorage { depth: 0 }.visit_file_mut(&mut file);
             let body = syn::parse_file(include_str!("unknown_storage.rs")).expect("storage syntax");
             let body = body.items;

@@ -1,8 +1,7 @@
 #![allow(clippy::disallowed_methods)]
 
 use std::mem::{align_of, size_of};
-use waproto::buffa::Message as _;
-use waproto::buffa::{UnknownField, UnknownFieldData, UnknownFields};
+use waproto::buffa::{Message, UnknownField, UnknownFieldData, UnknownFields};
 use waproto::whatsapp::__unknown_storage::Storage;
 
 fn future() -> UnknownFields {
@@ -52,9 +51,25 @@ fn empty_retained_capacity_and_replaced_owners_drop_once() {
 
 #[test]
 fn shared_message_clones_keep_unknown_wire_after_original_is_dropped() {
-    fn check<T: waproto::buffa::Message + Clone>() {
-        // Future field 1000 holds an owned payload.
-        let wire = [0xc2, 0x3e, 4, 11, 22, 33, 44];
+    fn check<T: Message + Clone>() {
+        let mut unknown = UnknownFields::new();
+        for (index, data) in [
+            UnknownFieldData::Varint(u64::MAX),
+            UnknownFieldData::Fixed64(0x1122_3344_5566_7788),
+            UnknownFieldData::Fixed32(0xaabb_ccdd),
+            UnknownFieldData::LengthDelimited(vec![11, 22, 33, 44]),
+            UnknownFieldData::Group(future()),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            unknown.push(UnknownField {
+                number: 1000 + index as u32,
+                data,
+            });
+        }
+        let mut wire = Vec::new();
+        unknown.write_to(&mut wire);
         let message = T::decode_from_slice(&wire).unwrap();
         let cloned = message.clone();
         drop(message);
