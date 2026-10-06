@@ -667,14 +667,18 @@ async fn resident_buffer_failure_recovers_without_another_server_delivery() {
     assert_eq!(f.receipts(), 0);
     assert!(f.pending().await.is_none());
     f.buffer_failure(false);
-    tokio::time::timeout(std::time::Duration::from_secs(6), async {
-        while f.published().is_empty() {
+    let published = tokio::time::timeout(std::time::Duration::from_secs(6), async {
+        loop {
+            let published = f.published();
+            if !published.is_empty() {
+                break published;
+            }
             tokio::task::yield_now().await;
         }
     })
     .await
     .unwrap();
     crate::test_utils::wait_for_outbound_tasks(&f.client).await;
-    assert_eq!(f.published(), ["synthetic retained body"]);
+    assert_eq!(published, ["synthetic retained body"]);
     assert_eq!(f.receipts(), 1);
 }
