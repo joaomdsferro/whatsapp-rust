@@ -660,25 +660,45 @@ async fn stalled_hook_does_not_block_an_unrelated_live_chat() {
 }
 
 #[tokio::test]
-async fn resident_buffer_failure_recovers_without_another_server_delivery() {
-    let mut f = Fixture::new("LOCAL_RECOVERY", false).await;
-    f.buffer_failure(true);
-    f.receive().await;
-    assert_eq!(f.receipts(), 0);
-    assert!(f.pending().await.is_none());
-    f.buffer_failure(false);
-    let published = tokio::time::timeout(std::time::Duration::from_secs(6), async {
-        loop {
-            let published = f.published();
-            if !published.is_empty() {
-                break published;
+async fn resident_failures_recover_without_another_server_delivery() {
+    for drain in [false, true] {
+        for hook_failure in [false, true] {
+            let mut f = Fixture::new("LOCAL_RECOVERY", drain).await;
+            if hook_failure {
+                f.hook.fail.store(true, Ordering::SeqCst);
+            } else {
+                f.buffer_failure(true);
             }
-            tokio::task::yield_now().await;
+            f.receive().await;
+            if drain {
+                let durable = f
+                    .client
+                    .flush_inbound_commits_under_permit(false, None, None)
+                    .await;
+                assert_eq!(durable, hook_failure);
+            }
+            assert_eq!(f.receipts(), 0);
+            assert_eq!(f.pending().await.is_some(), hook_failure);
+            if hook_failure {
+                f.hook.fail.store(false, Ordering::SeqCst);
+            } else {
+                f.buffer_failure(false);
+            }
+            let published = tokio::time::timeout(std::time::Duration::from_secs(6), async {
+                loop {
+                    let published = f.published();
+                    if !published.is_empty() {
+                        break published;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .unwrap();
+            crate::test_utils::wait_for_outbound_tasks(&f.client).await;
+            assert_eq!(published, ["synthetic retained body"]);
+            assert_eq!(f.receipts(), 1);
+            assert!(f.pending().await.is_none());
         }
-    })
-    .await
-    .unwrap();
-    crate::test_utils::wait_for_outbound_tasks(&f.client).await;
-    assert_eq!(published, ["synthetic retained body"]);
-    assert_eq!(f.receipts(), 1);
+    }
 }
