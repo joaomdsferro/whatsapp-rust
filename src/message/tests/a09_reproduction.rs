@@ -1077,7 +1077,7 @@ async fn restart_participant_alias(first_device: bool, multiple_rows: bool) {
     let id = f.info.id.to_string();
     let extra_sender = "100000000000024:76@lid";
     let foreign_sender = "100000000000024@s.whatsapp.net";
-    let foreign_bytes = b"invalid protobuf kept in another namespace";
+    let foreign_bytes = b"\0unsupported-foreign-envelope";
     backend
         .store_pending_inbound(&chat, foreign_sender, &id, foreign_bytes)
         .await
@@ -1277,7 +1277,7 @@ async fn pending_lookup_in_a_dm_does_not_merge_sender_devices() {
         .await
         .unwrap();
     backend
-        .store_pending_inbound(&chat, &other, &f.info.id, b"unreadable other device")
+        .store_pending_inbound(&chat, &other, &f.info.id, b"\0unreadable other device")
         .await
         .unwrap();
     let replay = f
@@ -1297,6 +1297,6 @@ async fn pending_lookup_in_a_dm_does_not_merge_sender_devices() {
             .await
             .unwrap()
             .unwrap(),
-        b"unreadable other device"
+        b"\0unreadable other device"
     );
 }
