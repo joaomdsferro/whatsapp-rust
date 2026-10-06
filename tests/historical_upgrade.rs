@@ -254,7 +254,41 @@ async fn produce(dir: &Path) {
     .unwrap();
 }
 
-async fn consume(dir: &Path) {
+struct Scratch(std::path::PathBuf);
+
+impl Scratch {
+    fn new() -> Self {
+        let path = std::env::temp_dir().join(format!("a12-historical-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&path).unwrap();
+        Self(path)
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[test]
+fn scratch_is_removed_after_failed_qualification() {
+    let scratch = Scratch::new();
+    let path = scratch.0.clone();
+    let retained_path = path.clone();
+    let result = std::panic::catch_unwind(move || {
+        let _scratch = scratch;
+        for name in ["candidate.db", "candidate.db-wal", "candidate.db-shm"] {
+            std::fs::write(path.join(name), b"synthetic state").unwrap();
+        }
+        panic!("injected qualification failure");
+    });
+    assert!(result.is_err());
+    assert!(!retained_path.exists());
+    // The guard also runs on ordinary return; the panic case catches regressions
+    // where cleanup is accidentally moved back behind the final assertion.
+}
+
+fn copy_historical_database(dir: &Path) -> Scratch {
     let manifest: serde_json::Value =
         serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap();
     assert_eq!(manifest["producer_sha"], BASELINE);
@@ -265,10 +299,15 @@ async fn consume(dir: &Path) {
             "fixture digest: {name}"
         );
     }
-    let scratch = std::env::temp_dir().join(format!("a12-historical-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir(&scratch).unwrap();
-    let database = scratch.join("candidate.db");
+    let scratch = Scratch::new();
+    let database = scratch.0.join("candidate.db");
     std::fs::copy(dir.join("historical.db"), &database).unwrap();
+    scratch
+}
+
+async fn consume(dir: &Path) {
+    let scratch = copy_historical_database(dir);
+    let database = scratch.0.join("candidate.db");
     let path = database.to_str().unwrap();
     {
         let mut alice = Peer::open(path, 1).await;
@@ -406,7 +445,7 @@ async fn consume(dir: &Path) {
         alice.flush().await;
         bob.flush().await;
     }
-    std::fs::remove_dir_all(scratch).unwrap();
+    drop(scratch);
 }
 
 #[tokio::test]
@@ -419,4 +458,97 @@ async fn historical_writer_upgrade_decrypt_send_restart() {
     } else {
         consume(dir).await;
     }
+}
+
+// Golden framing bytes are deliberately independent of the private A09 encoder.
+// This checks storage compatibility; client replay is qualified separately by
+// the runtime's restart/re-encryption tests, not by a duplicate replay decoder.
+#[tokio::test]
+#[ignore = "requires explicit synthetic historical-writer fixture"]
+async fn historical_pending_and_multipart_survive_reopen() {
+    let directory = std::env::var("A12_FIXTURE_DIR").expect("A12_FIXTURE_DIR is required");
+    let dir = Path::new(&directory);
+    let original_digest = digest(&dir.join("historical.db"));
+    let scratch = copy_historical_database(dir);
+    let database = scratch.0.join("candidate.db");
+    let path = database.to_str().unwrap();
+    let chat = "15550008001@s.whatsapp.net";
+    let sender = "15550008002@s.whatsapp.net";
+    let legacy: Vec<_> = (1..=2)
+        .map(|id| std::fs::read(dir.join(format!("payload-{id}.bin"))).unwrap())
+        .collect();
+    let mut multipart = b"\0WAPI\x01".to_vec();
+    for part in [&legacy[0], &legacy[1], &legacy[1]] {
+        multipart.extend_from_slice(&(part.len() as u64).to_be_bytes());
+        multipart.extend_from_slice(part);
+    }
+    // Future versions and torn writes must remain available for repair too.
+    let future = b"\0WAPI\x02opaque".to_vec();
+    let truncated = multipart[..multipart.len() - 1].to_vec();
+    let records = [
+        ("multi", multipart),
+        ("future", future),
+        ("torn", truncated),
+    ];
+    {
+        let store = open_store(path, 1).await;
+        for (id, bytes) in &records {
+            store
+                .store_pending_inbound(chat, sender, id, bytes)
+                .await
+                .unwrap();
+        }
+    }
+    for cycle in 0..2 {
+        let store = open_store(path, 1).await;
+        let other = open_store(path, 2).await;
+        for (id, bytes) in &records {
+            assert_eq!(
+                store
+                    .get_pending_inbound(chat, sender, id)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                Some(bytes)
+            );
+            assert!(
+                other
+                    .get_pending_inbound(chat, sender, id)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert_eq!(
+            other
+                .get_pending_inbound(chat, sender, "pending")
+                .await
+                .unwrap()
+                .as_ref(),
+            Some(&legacy[1])
+        );
+        assert_eq!(
+            store
+                .get_pending_inbound(chat, sender, "pending")
+                .await
+                .unwrap(),
+            (cycle == 0).then(|| legacy[0].clone())
+        );
+        assert_eq!(
+            store
+                .get_sent_message(chat, "retry")
+                .await
+                .unwrap()
+                .as_ref(),
+            Some(&legacy[0])
+        );
+        if cycle == 0 {
+            store
+                .delete_pending_inbound(chat, sender, "pending")
+                .await
+                .unwrap();
+        }
+    }
+    // The original historical artifact is never migrated in place.
+    assert_eq!(digest(&dir.join("historical.db")), original_digest);
 }
