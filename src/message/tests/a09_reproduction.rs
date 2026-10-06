@@ -736,3 +736,312 @@ async fn reconnect_waits_for_an_older_drain_commit_of_the_same_identity() {
     assert_eq!(f.published(), ["synthetic retained body"]);
     assert_eq!(f.client.inbound_commit_batch.retention.stats().0, 0);
 }
+
+async fn p1_group_spelling_receipt(first_device: bool) {
+    let mut f = Fixture::new("P1_GROUP_RECEIPT", false).await;
+    let group: Jid = "120363000000000019@g.us".parse().unwrap();
+    let mut peer = joined_group_sender(&f.client, "100000000000019:75@lid", &group).await;
+    let bare = peer.jid.to_non_ad();
+    let (first, second) = if first_device {
+        (peer.jid.clone(), bare)
+    } else {
+        (bare, peer.jid.clone())
+    };
+    let ciphertext = encrypt_group_text(&mut peer, &group, "retained group part").await;
+    f.stanza = group_skmsg_stanza(&group, &first, &f.info.id, ciphertext.clone());
+    f.info = f.client.parse_message_info(f.stanza.get()).await.unwrap();
+    assert_eq!(
+        f.info.source.sender, first,
+        "the fixture must preserve the participant spelling"
+    );
+    f.buffer_failure(true);
+    f.receive().await;
+    assert_eq!(f.receipts(), 0);
+    f.stanza = group_skmsg_stanza(&group, &second, &f.info.id, ciphertext);
+    assert_eq!(
+        f.client
+            .parse_message_info(f.stanza.get())
+            .await
+            .unwrap()
+            .source
+            .sender,
+        second
+    );
+    f.receive().await;
+    assert_eq!(f.hook.committed.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        f.receipts(),
+        0,
+        "an alternate participant spelling cannot bypass the pending hook"
+    );
+    f.buffer_failure(false);
+    let published = tokio::time::timeout(std::time::Duration::from_secs(9), async {
+        loop {
+            let bodies = f.published();
+            if !bodies.is_empty() {
+                break bodies;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(published, ["retained group part"]);
+    assert_eq!(f.client.inbound_commit_batch.retention.stats(), (0, 0));
+}
+#[tokio::test]
+async fn p1_group_device_to_bare_does_not_receipt_before_hook() {
+    p1_group_spelling_receipt(true).await;
+}
+#[tokio::test]
+async fn p1_group_bare_to_device_does_not_receipt_before_hook() {
+    p1_group_spelling_receipt(false).await;
+}
+
+async fn p1_group_spelling_drain(first_device: bool) {
+    let mut f = Fixture::new("P1_GROUP_DRAIN", true).await;
+    let group: Jid = "120363000000000020@g.us".parse().unwrap();
+    let mut peer = joined_group_sender(&f.client, "100000000000020:75@lid", &group).await;
+    let bare = peer.jid.to_non_ad();
+    let (first, second) = if first_device {
+        (peer.jid.clone(), bare)
+    } else {
+        (bare, peer.jid.clone())
+    };
+    f.stanza = group_skmsg_stanza(
+        &group,
+        &first,
+        &f.info.id,
+        encrypt_group_text(&mut peer, &group, "one group body").await,
+    );
+    f.info = f.client.parse_message_info(f.stanza.get()).await.unwrap();
+    assert_eq!(f.info.source.sender, first);
+    f.receive().await;
+    f.stanza = group_skmsg_stanza(
+        &group,
+        &second,
+        &f.info.id,
+        encrypt_group_text(&mut peer, &group, "one group body").await,
+    );
+    assert_eq!(
+        f.client
+            .parse_message_info(f.stanza.get())
+            .await
+            .unwrap()
+            .source
+            .sender,
+        second
+    );
+    f.receive().await;
+    assert!(
+        f.client
+            .flush_inbound_commits_under_permit(true, None, None)
+            .await
+    );
+    assert_eq!(f.hook.committed.load(Ordering::SeqCst), 1);
+    assert_eq!(f.published(), ["one group body"]);
+    for sender in [first, second] {
+        assert!(
+            f.client
+                .persistence_manager
+                .backend()
+                .get_pending_inbound(&group.to_string(), &sender.to_string(), &f.info.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+    assert_eq!(
+        f.client.inbound_commit_batch.retention.stats(),
+        (0, 0),
+        "all physical arrivals must release their reservations"
+    );
+}
+#[tokio::test]
+async fn p1_group_device_to_bare_drain_releases_all_admissions() {
+    p1_group_spelling_drain(true).await;
+}
+#[tokio::test]
+async fn p1_group_bare_to_device_drain_releases_all_admissions() {
+    p1_group_spelling_drain(false).await;
+}
+
+async fn p1_group_parts(
+    peer: &mut AlicePeer,
+    group: &Jid,
+    id: &str,
+    bodies: &[&str],
+) -> Arc<OwnedNodeRef> {
+    let mut children = Vec::new();
+    for body in bodies {
+        let mut wire = Vec::new();
+        let mut message = wa::Message::default();
+        message.conversation = Some((*body).to_owned());
+        waproto::codec::message_encode_into(&message, &mut wire);
+        wire.extend_from_slice(&[0xc0, 0x3e, 7]); // preserved future protobuf field
+        let message = waproto::codec::message_decode(&wire).unwrap();
+        let ciphertext = peer
+            .encrypt_group_message(group, &MessageUtils::encode_and_pad(&message))
+            .await;
+        children.push(
+            NodeBuilder::new("enc")
+                .attr("type", "skmsg")
+                .attr("v", "2")
+                .bytes(ciphertext)
+                .build(),
+        );
+    }
+    node_to_arc(
+        NodeBuilder::new("message")
+            .attr("from", group.clone())
+            .attr("participant", peer.jid.clone())
+            .attr("id", id)
+            .attr("t", wacore::time::now_secs().to_string())
+            .attr("type", "text")
+            .attr("addressing_mode", "lid")
+            .children(children)
+            .build(),
+    )
+}
+async fn p1_restart_parts(bodies: &[&str]) {
+    use crate::socket::NoiseSocket;
+    use crate::transport::mock::CapturingMockTransportFactory;
+    use wacore::handshake::NoiseCipher;
+    let mut f = Fixture::new("P1_RESTART", false).await;
+    let group: Jid = "120363000000000021@g.us".parse().unwrap();
+    let mut peer = joined_group_sender(&f.client, "100000000000021:75@lid", &group).await;
+    f.stanza = p1_group_parts(&mut peer, &group, &f.info.id, bodies).await;
+    f.info = f.client.parse_message_info(f.stanza.get()).await.unwrap();
+    f.hook.fail.store(true, Ordering::SeqCst);
+    f.receive().await;
+    assert_eq!(f.hook.attempts.load(Ordering::SeqCst), bodies.len());
+    let original = f.pending().await.unwrap();
+    let backend = f.client.persistence_manager.backend();
+    let pm = Arc::new(PersistenceManager::new(backend).await.unwrap());
+    let factory = CapturingMockTransportFactory::new();
+    let transport = factory.transport();
+    let (client, _) = Client::builder()
+        .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+        .with_persistence_manager(pm)
+        .with_transport_factory_arc(Arc::new(factory))
+        .with_http_client_arc(Arc::new(MockHttpClient))
+        .build()
+        .await
+        .unwrap()
+        .into_parts();
+    seed_test_pn(&client).await;
+    client.enter_live_mode_for_tests();
+    client.set_connected_for_test(true);
+    *client.noise_socket.lock().unwrap() = Some(Arc::new(NoiseSocket::new(
+        client.runtime.clone(),
+        transport.clone(),
+        NoiseCipher::new(&[0; 32]).unwrap(),
+        NoiseCipher::new(&[0; 32]).unwrap(),
+    )));
+    client
+        .inbound_durability_hook
+        .set(f.hook.clone())
+        .ok()
+        .unwrap();
+    let (handler, events) = ChannelEventHandler::new();
+    client.core.event_bus.subscribe_handler(handler).detach();
+    f.client = client;
+    f.transport = transport;
+    f.events = events;
+    f.hook.attempts.store(0, Ordering::SeqCst);
+    f.stanza = p1_group_parts(&mut peer, &group, &f.info.id, bodies).await;
+    f.receive().await;
+    assert_eq!(
+        f.hook.attempts.load(Ordering::SeqCst),
+        bodies.len(),
+        "a re-encrypted replay must retain original multiplicity"
+    );
+    assert_eq!(
+        f.pending().await.unwrap(),
+        original,
+        "failed replay must leave opaque stored bytes unchanged"
+    );
+    f.hook.fail.store(false, Ordering::SeqCst);
+    f.receive().await;
+    assert_eq!(f.hook.committed.load(Ordering::SeqCst), bodies.len());
+    assert_eq!(f.published(), bodies);
+    assert!(f.pending().await.is_none());
+}
+#[tokio::test]
+async fn p1_restart_reencrypted_single_part_does_not_grow() {
+    p1_restart_parts(&["A"]).await;
+}
+#[tokio::test]
+async fn p1_restart_reencrypted_repeated_parts_do_not_grow() {
+    p1_restart_parts(&["A", "A"]).await;
+}
+#[tokio::test]
+async fn p1_restart_reencrypted_mixed_parts_do_not_grow() {
+    p1_restart_parts(&["A", "B", "B"]).await;
+}
+
+async fn p1_two_reconnects(cancel_old: bool) {
+    let mut f = Fixture::new("P1_TWO_RECONNECTS", true).await;
+    f.stanza = encrypted_parts(
+        &f.client,
+        "12025550129:7@s.whatsapp.net",
+        &f.info.id,
+        &["first", "second"],
+    )
+    .await;
+    f.info = f.client.parse_message_info(f.stanza.get()).await.unwrap();
+    f.hook.pause_first.store(true, Ordering::SeqCst);
+    f.hook.fail.store(!cancel_old, Ordering::SeqCst);
+    f.receive().await;
+    let client = f.client.clone();
+    let old = tokio::spawn(async move {
+        client
+            .flush_inbound_commits_under_permit(false, None, None)
+            .await
+    });
+    f.hook.entered.notified().await;
+    f.client.cleanup_connection_state().await;
+    f.client.enter_live_mode_for_tests();
+    let mut newer = tokio::spawn(f.client.clone().handle_incoming_message(f.stanza.clone()));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), &mut newer)
+            .await
+            .is_err()
+    );
+    f.client.cleanup_connection_state().await;
+    f.client.enter_live_mode_for_tests();
+    if cancel_old {
+        old.abort();
+        assert!(old.await.unwrap_err().is_cancelled());
+    } else {
+        f.hook.release.notify_one();
+        assert!(old.await.unwrap());
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(2), newer)
+        .await
+        .unwrap()
+        .unwrap();
+    f.hook.fail.store(false, Ordering::SeqCst);
+    let published = tokio::time::timeout(std::time::Duration::from_secs(9), async {
+        loop {
+            let bodies = f.published();
+            if !bodies.is_empty() {
+                break bodies;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("retained parts must retry after the stale producer exits");
+    assert_eq!(published, ["first", "second"]);
+    assert!(f.pending().await.is_none());
+    assert_eq!(f.client.inbound_commit_batch.retention.stats(), (0, 0));
+}
+#[tokio::test]
+async fn p1_two_reconnects_after_hook_failure_keep_retrying() {
+    p1_two_reconnects(false).await;
+}
+#[tokio::test]
+async fn p1_two_reconnects_after_hook_cancellation_keep_retrying() {
+    p1_two_reconnects(true).await;
+}
