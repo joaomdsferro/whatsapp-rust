@@ -1935,3 +1935,7 @@ mod tests {
         guards.len()
     }
 }
+
+#[cfg(test)]
+#[path = "tests/a09_restore.rs"]
+mod restore_tests;
