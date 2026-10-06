@@ -1159,3 +1159,144 @@ async fn restart_alias_bare_to_device_replays_before_receipt() {
 async fn restart_alias_multiple_rows_preserve_parts_and_settle_all_keys() {
     restart_participant_alias(true, true).await;
 }
+
+#[tokio::test]
+async fn restart_alias_corruption_withholds_receipt_until_matching_rows_are_repaired() {
+    let mut f = Fixture::new("RESTART_CORRUPT_ALIAS", false).await;
+    let group: Jid = "120363000000000025@g.us".parse().unwrap();
+    let mut peer = joined_group_sender(&f.client, "100000000000025:75@lid", &group).await;
+    f.stanza = p1_group_parts(&mut peer, &group, &f.info.id, &["A", "A"]).await;
+    f.info = f.client.parse_message_info(f.stanza.get()).await.unwrap();
+    f.hook.fail.store(true, Ordering::SeqCst);
+    f.receive().await;
+    let original = f.pending().await.unwrap();
+    let backend = f.client.persistence_manager.backend();
+    let chat = group.to_string();
+    let id = f.info.id.to_string();
+    let alias = peer.jid.to_non_ad().to_string();
+    let corrupt = b"\0WAPI\x02future-version";
+    backend
+        .store_pending_inbound(&chat, &alias, &id, corrupt)
+        .await
+        .unwrap();
+    f.restart().await;
+    f.stanza = with_participant(&f.stanza, &peer.jid.to_non_ad());
+    f.receive().await;
+    assert_eq!(f.receipts(), 0);
+    assert_eq!(f.hook.attempts.load(Ordering::SeqCst), 0);
+    assert_eq!(f.pending().await.unwrap(), original);
+    assert_eq!(
+        backend
+            .get_pending_inbound(&chat, &alias, &id)
+            .await
+            .unwrap()
+            .unwrap(),
+        corrupt
+    );
+    // Explicit fixture repair, never an SDK rewrite/delete of unknown bytes.
+    backend
+        .store_pending_inbound(&chat, &alias, &id, &original)
+        .await
+        .unwrap();
+    f.hook.fail.store(false, Ordering::SeqCst);
+    f.receive().await;
+    assert_eq!(f.hook.committed.load(Ordering::SeqCst), 2);
+    assert_eq!(f.published(), ["A", "A"]);
+    assert_eq!(f.receipts(), 1);
+    assert!(
+        backend
+            .get_pending_inbound_for_message(&chat, &id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(f.client.inbound_commit_batch.retention.stats(), (0, 0));
+}
+
+#[tokio::test]
+async fn restart_alias_conflicting_part_order_preserves_both_records() {
+    let mut f = Fixture::new("RESTART_ORDER_ALIAS", false).await;
+    let group: Jid = "120363000000000026@g.us".parse().unwrap();
+    let mut peer = joined_group_sender(&f.client, "100000000000026:75@lid", &group).await;
+    f.stanza = p1_group_parts(&mut peer, &group, &f.info.id, &["A", "B"]).await;
+    f.info = f.client.parse_message_info(f.stanza.get()).await.unwrap();
+    f.hook.fail.store(true, Ordering::SeqCst);
+    f.receive().await;
+    let original = f.pending().await.unwrap();
+    let backend = f.client.persistence_manager.backend();
+    let chat = group.to_string();
+    let id = f.info.id.to_string();
+    let alias = peer.jid.to_non_ad().to_string();
+    let reversed: Vec<Vec<u8>> = durability::decode_pending_parts(&original)
+        .unwrap()
+        .into_iter()
+        .rev()
+        .map(|message| {
+            let mut bytes = Vec::new();
+            waproto::codec::message_encode_into(&message, &mut bytes);
+            bytes
+        })
+        .collect();
+    let reversed =
+        durability::encode_pending_parts(&reversed.iter().map(Vec::as_slice).collect::<Vec<_>>());
+    backend
+        .store_pending_inbound(&chat, &alias, &id, &reversed)
+        .await
+        .unwrap();
+    f.restart().await;
+    f.stanza = with_participant(&f.stanza, &peer.jid.to_non_ad());
+    f.receive().await;
+    assert_eq!(f.receipts(), 0);
+    assert_eq!(f.hook.attempts.load(Ordering::SeqCst), 0);
+    assert_eq!(f.pending().await.unwrap(), original);
+    assert_eq!(
+        backend
+            .get_pending_inbound(&chat, &alias, &id)
+            .await
+            .unwrap()
+            .unwrap(),
+        reversed
+    );
+    assert_eq!(f.client.inbound_commit_batch.retention.stats(), (0, 0));
+}
+
+#[tokio::test]
+async fn pending_lookup_in_a_dm_does_not_merge_sender_devices() {
+    let f = Fixture::new("DIRECT_DEVICE_BOUNDARY", false).await;
+    let backend = f.client.persistence_manager.backend();
+    let chat = f.info.source.chat.to_string();
+    let sender = f.info.source.sender.to_string();
+    let other = f.info.source.sender.to_non_ad().to_string();
+    assert_ne!(sender, other);
+    let mut message = wa::Message::default();
+    message.conversation = Some("exact device only".into());
+    let mut bytes = Vec::new();
+    waproto::codec::message_encode_into(&message, &mut bytes);
+    backend
+        .store_pending_inbound(&chat, &sender, &f.info.id, &bytes)
+        .await
+        .unwrap();
+    backend
+        .store_pending_inbound(&chat, &other, &f.info.id, b"unreadable other device")
+        .await
+        .unwrap();
+    let replay = f
+        .client
+        .load_pending_inbound(&Arc::new(f.info.clone()))
+        .await
+        .unwrap();
+    assert_eq!(replay.items.len(), 1);
+    assert_eq!(
+        replay.items[0].message.conversation.as_deref(),
+        Some("exact device only")
+    );
+    assert_eq!(replay.keys, [(chat.clone(), sender, f.info.id.to_string())]);
+    assert_eq!(
+        backend
+            .get_pending_inbound(&chat, &other, &f.info.id)
+            .await
+            .unwrap()
+            .unwrap(),
+        b"unreadable other device"
+    );
+}
