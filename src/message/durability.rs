@@ -217,6 +217,30 @@ mod tests {
         assert!(decode_pending_parts(&oversized).is_err());
     }
 
+    #[test]
+    fn extending_a_pending_record_keeps_legacy_bytes_and_part_multiplicity() {
+        let original = [10, 1, b'x', 0xc0, 0x3e, 7];
+        let mut canonical = Vec::new();
+        waproto::codec::message_encode_into(
+            &decode_pending_parts(&original).unwrap()[0],
+            &mut canonical,
+        );
+        let proposed = encode_pending_parts(&[&canonical, &[10, 1, b'y'], &[10, 1, b'y']]);
+        let extended = extend_pending_record(&original, &proposed)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            pending_parts(&extended).unwrap(),
+            [&original[..], &[10, 1, b'y'], &[10, 1, b'y']]
+        );
+        assert!(extend_pending_record(&original, &[10, 1, b'y']).is_err());
+        assert!(
+            extend_pending_record(&original, &canonical)
+                .unwrap()
+                .is_none()
+        );
+    }
+
     struct CountingHook {
         calls: AtomicUsize,
         messages: AtomicUsize,

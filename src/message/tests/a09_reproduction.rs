@@ -527,6 +527,23 @@ async fn exhausted_admission_returns_before_decrypt_or_hook() {
     let leases: Vec<_> = (0..400)
         .map(|_| f.client.inbound_commit_batch.retention.admit(1).unwrap())
         .collect();
+    // Control responses do not acquire inbound message reservations.
+    let (tx, rx) = futures::channel::oneshot::channel();
+    f.client.response_waiters_guard().insert(
+        "CONTROL_WHILE_FULL".to_owned(),
+        crate::client::ResponseWaiter::Iq(tx),
+    );
+    let ack = node_to_arc(
+        NodeBuilder::new("ack")
+            .attr("id", "CONTROL_WHILE_FULL")
+            .attr("from", "s.whatsapp.net")
+            .build(),
+    );
+    assert!(f.client.handle_ack_response_arc(&ack));
+    tokio::time::timeout(std::time::Duration::from_millis(100), rx)
+        .await
+        .unwrap()
+        .unwrap();
     let mut cancelled = false;
     tokio::time::timeout(
         std::time::Duration::from_millis(100),
@@ -640,4 +657,24 @@ async fn stalled_hook_does_not_block_an_unrelated_live_chat() {
     f.hook.release.notify_one();
     task.await.unwrap();
     assert_eq!(f.hook.committed.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn resident_buffer_failure_recovers_without_another_server_delivery() {
+    let mut f = Fixture::new("LOCAL_RECOVERY", false).await;
+    f.buffer_failure(true);
+    f.receive().await;
+    assert_eq!(f.receipts(), 0);
+    assert!(f.pending().await.is_none());
+    f.buffer_failure(false);
+    tokio::time::timeout(std::time::Duration::from_secs(6), async {
+        while f.published().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    crate::test_utils::wait_for_outbound_tasks(&f.client).await;
+    assert_eq!(f.published(), ["synthetic retained body"]);
+    assert_eq!(f.receipts(), 1);
 }

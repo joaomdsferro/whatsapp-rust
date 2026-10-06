@@ -243,6 +243,8 @@ impl InboundCommitBatcher {
         self.reset_for_reconnect(false)
     }
 
+    /// Re-arm the connection's drain. Durability mode preserves entries and
+    /// Client-owned reservations; the legacy no-hook mode drops its batch.
     pub(crate) fn reset_for_reconnect(&self, preserve: bool) -> bool {
         if preserve {
             self.epoch.fetch_add(1, Ordering::AcqRel);
@@ -621,9 +623,9 @@ impl Client {
     /// persisted its rowless advances; the reset then dropped the entry and
     /// its redelivery was acked as a duplicate.
     ///
-    /// On timeout (stalled permit holder / hung hook) the cache is cleared
-    /// WITHOUT flushing: everything dirty then belongs to uncommitted
-    /// entries, and dropping both sides keeps redelivery consistent.
+    /// With a durability hook, a timeout preserves both the retained plaintext
+    /// and the Signal cache. Without one, the legacy timeout path clears dirty
+    /// cache state rather than persisting unbuffered advances.
     pub(crate) async fn teardown_inbound_commits_bounded(
         self: &Arc<Self>,
         limit: std::time::Duration,
@@ -915,8 +917,9 @@ impl Client {
     /// misbehaving synchronous handler cannot suppress them — the contract the
     /// pre-batch at-most-once path had. A crash between ack and event trades
     /// exactly like that old path: the consumer's durable copy is the hook
-    /// commit, not the event. On any commit failure everything stays unacked
-    /// and the server redelivers the whole batch.
+    /// commit, not the event. Commit failures suppress receipts; resident
+    /// durability-mode entries remain available to retry without another
+    /// incoming delivery. Receipt suppression is not a server replay guarantee.
     ///
     /// Drain commits also flush the Signal cache (bulk signal-store commit per
     /// snapshot, WA Web ordering); live commits leave it to the per-stanza
@@ -1236,14 +1239,18 @@ impl Client {
         }
         let items = retained.map(Arc::from).unwrap_or(items);
         // Schedule receipts before synchronous consumer code can block or panic.
-        let mut receipted = std::collections::HashSet::new();
-        for item in arrived.iter() {
-            if receipted.insert((
-                &item.info.source.chat,
-                &item.info.source.sender,
-                &item.info.id,
-            )) {
-                self.ack_received_message(&item.info);
+        if arrived.len() == 1 {
+            self.ack_received_message(&arrived[0].info);
+        } else {
+            let mut receipted = std::collections::HashSet::new();
+            for item in arrived.iter() {
+                if receipted.insert((
+                    &item.info.source.chat,
+                    &item.info.source.sender,
+                    &item.info.id,
+                )) {
+                    self.ack_received_message(&item.info);
+                }
             }
         }
         if is_drain {
