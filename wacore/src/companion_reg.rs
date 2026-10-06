@@ -113,6 +113,7 @@ pub const fn companion_web_client_type_for_platform(
         | P::CLOUD_API
         | P::SMARTGLASSES
         | P::WAIL => C::OtherWebClient,
+        _ => C::OtherWebClient,
     }
 }
 
@@ -357,9 +358,10 @@ mod tests {
 
     #[test]
     fn for_props_reads_platform_type() {
-        let props = wa::DeviceProps {
-            platform_type: Some(wa::device_props::PlatformType::CHROME),
-            ..Default::default()
+        let props = {
+            let mut proto = wa::DeviceProps::default();
+            proto.platform_type = Some(wa::device_props::PlatformType::CHROME);
+            proto
         };
         assert_eq!(
             companion_web_client_type_for_props(&props),
