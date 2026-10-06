@@ -978,7 +978,7 @@ impl Client {
         // than letting the backend's replace-into retain only the tail.
         let mut groups: Vec<Vec<usize>> = Vec::new();
         let mut indexes = std::collections::HashMap::new();
-        for (i, (item, (chat, sender))) in items.iter().zip(keys).enumerate() {
+        for (i, (item, (chat, sender))) in items.iter().zip(&keys).enumerate() {
             let index = *indexes
                 .entry((chat, sender, &item.info.id))
                 .or_insert_with(|| {
