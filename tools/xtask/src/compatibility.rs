@@ -3,7 +3,11 @@ use crate::consumers::{self, Lane};
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
 use serde_json::Value;
-use std::{collections::BTreeSet, path::Path, process::Command};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+    process::Command,
+};
 use xtask_support::{capture, run as execute};
 
 const POLICY: &str = "tools/xtask/compatibility.json";
@@ -202,26 +206,59 @@ fn manifest_at(root: &Path, baseline: &str, path: &str) -> Result<toml::Value> {
     Ok(toml::from_str(std::str::from_utf8(&bytes)?)?)
 }
 
-fn feature_contract(before: &toml::Value, after: &toml::Value, profile: &Profile) -> Result<()> {
-    for feature in profile
+type FeatureGraph = BTreeMap<String, Option<BTreeSet<String>>>;
+
+fn reachable_features(manifest: &toml::Value, profile: &Profile) -> Result<FeatureGraph> {
+    let mut pending = profile
         .features
         .iter()
-        .map(String::as_str)
-        .chain(profile.defaults.then_some("default"))
-    {
-        let definition = |manifest: &toml::Value| {
-            manifest
-                .get("features")
-                .and_then(|v| v.get(feature))
-                .cloned()
-        };
-        ensure!(
-            definition(before) == definition(after),
-            "{}/{} changed the {feature} feature graph; review the contract explicitly",
-            profile.package,
-            profile.name
-        );
+        .cloned()
+        .chain(profile.defaults.then(|| "default".into()))
+        .collect::<Vec<_>>();
+    let mut graph = FeatureGraph::new();
+    while let Some(feature) = pending.pop() {
+        if graph.contains_key(&feature) {
+            continue;
+        }
+        let definition = manifest
+            .get("features")
+            .and_then(|v| v.get(&feature))
+            .map(|value| -> Result<BTreeSet<String>> {
+                value
+                    .as_array()
+                    .context("feature definition must be an array")?
+                    .iter()
+                    .map(|edge| {
+                        Ok(edge
+                            .as_str()
+                            .context("feature edge must be a string")?
+                            .to_owned())
+                    })
+                    .collect()
+            })
+            .transpose()?;
+        if let Some(edges) = &definition {
+            // Forwarded and weak dependency features remain edges of this node.
+            // Only local features have definitions to traverse in this manifest.
+            pending.extend(
+                edges
+                    .iter()
+                    .filter(|edge| !edge.starts_with("dep:") && !edge.contains('/'))
+                    .cloned(),
+            );
+        }
+        graph.insert(feature, definition);
     }
+    Ok(graph)
+}
+
+fn feature_contract(before: &toml::Value, after: &toml::Value, profile: &Profile) -> Result<()> {
+    ensure!(
+        reachable_features(before, profile)? == reachable_features(after, profile)?,
+        "{}/{} changed a reachable feature definition; review the contract explicitly",
+        profile.package,
+        profile.name
+    );
     Ok(())
 }
 
@@ -413,5 +450,49 @@ mod tests {
         policy.profiles[0].defaults = true;
         assert!(feature_contract(&before, &after, &policy.profiles[0]).is_err());
         feature_contract(&before, &before, &policy.profiles[0]).unwrap();
+    }
+
+    #[test]
+    fn unchanged_default_cannot_hide_changed_child_forwarding() {
+        let mut policy = policy();
+        let profile = &mut policy.profiles[0];
+        profile.features.clear();
+        profile.defaults = true;
+        let before: toml::Value = toml::from_str(
+            r#"
+[features]
+default = ["sqlite-storage-bundled"]
+sqlite-storage-bundled = ["sqlite-storage", "store/bundled-sqlite"]
+sqlite-storage = ["dep:store"]
+unrelated = ["dep:experimental"]
+"#,
+        )
+        .unwrap();
+        let mut after = before.clone();
+        after["features"]["sqlite-storage-bundled"] =
+            toml::Value::Array(vec!["sqlite-storage".into()]);
+        assert!(feature_contract(&before, &after, profile).is_err());
+        after = before.clone();
+        after["features"]["unrelated"] = toml::Value::Array(vec![]);
+        feature_contract(&before, &after, profile).unwrap();
+    }
+
+    #[test]
+    fn reachable_feature_graph_handles_cycles_and_weak_forwarding() {
+        let mut policy = policy();
+        let profile = &mut policy.profiles[0];
+        profile.features = vec!["a".into()];
+        let before: toml::Value = toml::from_str(
+            "[features]\na = [\"b\", \"dep:adapter\"]\nb = [\"a\", \"adapter?/host\"]",
+        )
+        .unwrap();
+        let reordered: toml::Value = toml::from_str(
+            "[features]\na = [\"dep:adapter\", \"b\"]\nb = [\"adapter?/host\", \"a\"]",
+        )
+        .unwrap();
+        feature_contract(&before, &reordered, profile).unwrap();
+        let mut after = before.clone();
+        after["features"]["b"] = toml::Value::Array(vec!["a".into()]);
+        assert!(feature_contract(&before, &after, profile).is_err());
     }
 }
