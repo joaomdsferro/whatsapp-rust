@@ -105,7 +105,15 @@ impl SkippedKey {
             && pb.cipher_key.is_none()
             && pb.mac_key.is_none()
             && pb.iv.is_none()
+            && pb == {
+                let mut seed_only = session_structure::chain::MessageKey::default();
+                seed_only.index = pb.index;
+                seed_only.seed = pb.seed.clone();
+                seed_only
+            }
         {
+            // Compact only when every field is represented. Unknown wire data
+            // and future generated fields must keep the original protobuf.
             return Self::Seed { index, seed };
         }
         Self::Legacy(Box::new(pb))
@@ -2230,6 +2238,29 @@ mod tests {
             proto.message_keys = message_keys;
             proto
         }
+    }
+
+    #[test]
+    fn skipped_seed_preserves_future_fields_through_session_state() {
+        let mut seed_only = session_structure::chain::MessageKey::default();
+        seed_only.index = Some(7);
+        seed_only.seed = Some(bytes::Bytes::from_static(&[0x42; 32]));
+        assert!(matches!(
+            SkippedKey::from_pb(seed_only.clone()),
+            SkippedKey::Seed { .. }
+        ));
+        let mut wire = seed_only.encode_to_vec();
+        wire.extend_from_slice(&[0xa8, 0x06, 9]); // future field 101
+        let key = session_structure::chain::MessageKey::decode_from_slice(&wire).unwrap();
+        let mut chain = session_structure::Chain::default();
+        chain.message_keys.push(key);
+        let mut session = SessionStructure::default();
+        session.receiver_chains.push(chain);
+        let restored = SessionStructure::from(SessionState::from_session_structure(session));
+        assert_eq!(
+            restored.receiver_chains[0].message_keys[0].encode_to_vec(),
+            wire
+        );
     }
 
     /// Every walker charges only what hangs off a slot, and the owner charges
