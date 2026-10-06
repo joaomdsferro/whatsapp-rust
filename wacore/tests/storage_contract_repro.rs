@@ -1,6 +1,6 @@
-//! Deterministic evidence for the sequential storage defaults on the audited base.
-//! These tests assert the observed defect, not conformance. Replace their expectations
-//! with the required preservation/replay guarantees when the contracts are migrated.
+//! Frozen legacy implementations reproduce the removed defaults on the same public API.
+//! Atomic-mode probes delegate to the real memory backend and inject errors before
+//! its commit boundary. Regression tests require preservation and replay in that mode.
 #![cfg(not(target_arch = "wasm32"))]
 
 use bytes::Bytes;
@@ -17,6 +17,8 @@ use wacore::store::{
 };
 
 struct Probe {
+    legacy: bool,
+    fail_after_commit: AtomicBool,
     backend: InMemoryBackend,
     park_read: AtomicBool,
     resume_tx: async_channel::Sender<()>,
@@ -26,14 +28,27 @@ struct Probe {
 }
 impl Probe {
     fn new() -> Self {
+        Self::with_mode(true)
+    }
+    fn atomic() -> Self {
+        Self::with_mode(false)
+    }
+    fn with_mode(legacy: bool) -> Self {
         let (resume_tx, resume_rx) = async_channel::bounded(1);
         Self {
+            legacy,
+            fail_after_commit: AtomicBool::new(false),
             backend: InMemoryBackend::new(),
             park_read: AtomicBool::new(false),
             resume_tx,
             resume_rx,
             fail_write: AtomicUsize::new(0),
             writes: AtomicUsize::new(0),
+        }
+    }
+    async fn park_atomic(&self) {
+        if self.park_read.swap(false, Ordering::SeqCst) {
+            self.resume_rx.recv().await.unwrap();
         }
     }
     fn before_call(&self, method: &str) -> Result<()> {
@@ -100,6 +115,35 @@ macro_rules! forward_domains {
             }
         }
         impl AppSyncStore for $owner {
+            fn commit_patch<'s, 'a, 'b, 'c, 'async_trait>(
+                &'s self, name: &'a str, state: HashState,
+                removed_index_macs: &'b [Vec<u8>], added: &'c [AppStateMutationMAC],
+            ) -> BoxFuture<'async_trait, Result<()>>
+            where 's: 'async_trait, 'a: 'async_trait, 'b: 'async_trait, 'c: 'async_trait, Self: 'async_trait {
+                Box::pin(async move {
+                    if !self.legacy {
+                        self.before_call("set_version")?;
+                        if !removed_index_macs.is_empty() { self.before_call("delete_mutation_macs")?; }
+                        if !added.is_empty() { self.before_call("put_mutation_macs")?; }
+                        self.backend.commit_patch(name, state, removed_index_macs, added).await?;
+                        if self.fail_after_commit.load(Ordering::SeqCst) {
+                            return Err(StoreError::Validation("synthetic post-commit barrier failure".into()));
+                        }
+                        return Ok(());
+                    }
+
+        let version = state.version;
+        self.set_version(name, state).await?;
+        if !removed_index_macs.is_empty() {
+            self.delete_mutation_macs(name, removed_index_macs).await?;
+        }
+        if !added.is_empty() {
+            self.put_mutation_macs(name, version, added).await?;
+        }
+        Ok(())
+                })
+            }
+
             forward_methods! {
                 fn get_sync_key<'s, 'a>(this: &'s Self, key_id: &'a [u8]) -> Result<Option<AppStateSyncKey>>;
                 fn set_sync_key<'s, 'a>(this: &'s Self, key_id: &'a [u8], key: AppStateSyncKey) -> Result<()>;
@@ -115,6 +159,65 @@ macro_rules! forward_domains {
             }
         }
         impl ProtocolStore for $owner {
+            fn touch_tc_token_sender_timestamp<'s, 'a, 'async_trait>(
+                &'s self, jid: &'a str, sender_timestamp: i64,
+            ) -> BoxFuture<'async_trait, Result<()>>
+            where 's: 'async_trait, 'a: 'async_trait, Self: 'async_trait {
+                Box::pin(async move {
+                    if !self.legacy {
+                        self.park_atomic().await;
+                        return self.backend.touch_tc_token_sender_timestamp(jid, sender_timestamp).await;
+                    }
+
+        let entry = match self.get_tc_token(jid).await? {
+            Some(existing) => TcTokenEntry {
+                sender_timestamp: Some(
+                    existing
+                        .sender_timestamp
+                        .map_or(sender_timestamp, |e| e.max(sender_timestamp)),
+                ),
+                ..existing
+            },
+            None => TcTokenEntry {
+                token: Vec::new(),
+                token_timestamp: sender_timestamp,
+                sender_timestamp: Some(sender_timestamp),
+            },
+        };
+        self.put_tc_token(jid, &entry).await
+                })
+            }
+            fn store_received_tc_token<'s, 'a, 'b, 'async_trait>(
+                &'s self, jid: &'a str, token: &'b [u8], token_timestamp: i64,
+            ) -> BoxFuture<'async_trait, Result<()>>
+            where 's: 'async_trait, 'a: 'async_trait, 'b: 'async_trait, Self: 'async_trait {
+                Box::pin(async move {
+                    if !self.legacy {
+                        self.park_atomic().await;
+                        return self.backend.store_received_tc_token(jid, token, token_timestamp).await;
+                    }
+
+        let existing = self.get_tc_token(jid).await?;
+        // Keep a fresher real token; a placeholder never blocks the first real one.
+        if let Some(existing) = &existing
+            && !existing.token.is_empty()
+            && token_timestamp < existing.token_timestamp
+        {
+            return Ok(());
+        }
+        let sender_timestamp = existing.and_then(|existing| existing.sender_timestamp);
+        self.put_tc_token(
+            jid,
+            &TcTokenEntry {
+                token: token.to_vec(),
+                token_timestamp,
+                sender_timestamp,
+            },
+        )
+        .await
+                })
+            }
+
             fn get_tc_token<'s, 'a, 'async_trait>(&'s self, jid: &'a str) -> BoxFuture<'async_trait, Result<Option<TcTokenEntry>>>
             where 's: 'async_trait, 'a: 'async_trait, Self: 'async_trait {
                 Box::pin(async move {
@@ -196,7 +299,7 @@ impl DeviceStore for Probe {
 }
 
 #[tokio::test]
-async fn default_sender_write_loses_concurrent_real_token() {
+async fn legacy_sender_write_loses_concurrent_real_token() {
     let p = Probe::new();
     p.park_read.store(true, Ordering::SeqCst);
     let mut sender = Box::pin(p.touch_tc_token_sender_timestamp("100001@lid", 5000));
@@ -216,7 +319,7 @@ async fn default_sender_write_loses_concurrent_real_token() {
 }
 
 #[tokio::test]
-async fn default_received_write_loses_concurrent_sender_timestamp() {
+async fn legacy_received_write_loses_concurrent_sender_timestamp() {
     let p = Probe::new();
     p.park_read.store(true, Ordering::SeqCst);
     let mut received = Box::pin(p.store_received_tc_token("100001@lid", b"real", 4000));
@@ -236,7 +339,7 @@ async fn default_received_write_loses_concurrent_sender_timestamp() {
 }
 
 #[tokio::test]
-async fn default_received_write_regresses_newer_token() {
+async fn legacy_received_write_regresses_newer_token() {
     let p = Probe::new();
     p.park_read.store(true, Ordering::SeqCst);
     let mut stale = Box::pin(p.store_received_tc_token("100001@lid", b"old", 3000));
@@ -324,7 +427,9 @@ fn index_mac(index: &[u8]) -> Vec<u8> {
     wacore::appstate::hash::generate_index_mac(index, &expand_app_state_keys(&[7; 32]).index)
 }
 async fn seeded() -> Arc<Probe> {
-    let p = Arc::new(Probe::new());
+    seed(Arc::new(Probe::new())).await
+}
+async fn seed(p: Arc<Probe>) -> Arc<Probe> {
     p.backend
         .set_sync_key(
             b"synthetic-key",
@@ -348,7 +453,7 @@ async fn seeded() -> Arc<Probe> {
 }
 
 #[tokio::test]
-async fn default_commit_failure_leaves_cursor_ahead_and_restart_cannot_replay() {
+async fn legacy_commit_failure_leaves_cursor_ahead_and_restart_cannot_replay() {
     for fail_at in 1..=3 {
         let p = seeded().await;
         let proc = processor(p.clone());
@@ -433,7 +538,7 @@ async fn default_commit_failure_leaves_cursor_ahead_and_restart_cannot_replay() 
 }
 
 #[tokio::test]
-async fn default_commit_failure_preserves_earlier_result_but_persisted_cursor_can_disagree() {
+async fn legacy_commit_failure_preserves_earlier_result_but_persisted_cursor_can_disagree() {
     let p = seeded().await;
     let proc = processor(p.clone());
     let second = patch(&proc, vec![mutation(OLD, true, 2), mutation(NEW, false, 2)]).await;
@@ -464,5 +569,208 @@ async fn default_commit_failure_preserves_earlier_result_but_persisted_cursor_ca
         p.get_version("regular").await.unwrap().unwrap().version,
         3,
         "persisted cursor is ahead of the correctly reported committed result"
+    );
+}
+
+#[tokio::test]
+async fn atomic_token_merges_preserve_interleaved_updates() {
+    for operation in 0..3 {
+        let p = Probe::atomic();
+        p.park_read.store(true, Ordering::SeqCst);
+        let mut pending = match operation {
+            0 => p.touch_tc_token_sender_timestamp("100001@lid", 5000),
+            1 => p.store_received_tc_token("100001@lid", b"real", 4000),
+            _ => p.store_received_tc_token("100001@lid", b"old", 3000),
+        };
+        assert!(futures::poll!(pending.as_mut()).is_pending());
+        match operation {
+            0 => p
+                .backend
+                .store_received_tc_token("100001@lid", b"real", 4000)
+                .await
+                .unwrap(),
+            1 => p
+                .backend
+                .touch_tc_token_sender_timestamp("100001@lid", 5000)
+                .await
+                .unwrap(),
+            _ => p
+                .backend
+                .store_received_tc_token("100001@lid", b"new", 6000)
+                .await
+                .unwrap(),
+        }
+        p.resume_tx.send(()).await.unwrap();
+        pending.await.unwrap();
+        let row = p.get_tc_token("100001@lid").await.unwrap().unwrap();
+        if operation == 2 {
+            assert_eq!(row.token, b"new");
+            assert_eq!(row.token_timestamp, 6000);
+            assert_eq!(row.sender_timestamp, None);
+        } else {
+            assert_eq!(row.token, b"real");
+            assert_eq!(row.token_timestamp, 4000);
+            assert_eq!(row.sender_timestamp, Some(5000));
+        }
+    }
+}
+
+#[tokio::test]
+async fn atomic_commit_failure_keeps_cursor_and_macs_replayable_after_restart() {
+    for fail_at in 1..=3 {
+        let p = seed(Arc::new(Probe::atomic())).await;
+        let proc = processor(p.clone());
+        let before = p.get_version("regular").await.unwrap().unwrap();
+        let old_mac = p
+            .get_mutation_mac("regular", &index_mac(OLD))
+            .await
+            .unwrap();
+        let second = patch(&proc, vec![mutation(OLD, true, 2), mutation(NEW, false, 2)]).await;
+        p.fail_write.store(fail_at, Ordering::SeqCst);
+        let error = proc
+            .process_patch_list(list(vec![second.clone()]), true)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<StoreError>(),
+            Some(StoreError::Validation(_))
+        ));
+        let held = p.get_version("regular").await.unwrap().unwrap();
+        assert_eq!(held.version, before.version);
+        assert_eq!(held.hash, before.hash);
+        assert_eq!(
+            p.get_mutation_mac("regular", &index_mac(OLD))
+                .await
+                .unwrap(),
+            old_mac
+        );
+        assert!(
+            p.get_mutation_mac("regular", &index_mac(NEW))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        drop(proc);
+        p.fail_write.store(0, Ordering::SeqCst);
+        let restarted = processor(p.clone());
+        let (mutations, state, _) = restarted
+            .process_patch_list(list(vec![second]), true)
+            .await
+            .unwrap();
+        assert_eq!(mutations.len(), 2);
+        assert_eq!(state.version, 2);
+        assert!(!state.mac_mismatch_fatal);
+        assert!(
+            p.get_mutation_mac("regular", &index_mac(OLD))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            p.get_mutation_mac("regular", &index_mac(NEW))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let third = patch(&restarted, vec![mutation(NEW, false, 3)]).await;
+        let (_, state, _) = restarted
+            .process_patch_list(list(vec![third]), true)
+            .await
+            .unwrap();
+        assert_eq!(state.version, 3);
+        assert!(!state.mac_mismatch_fatal);
+    }
+}
+
+#[tokio::test]
+async fn atomic_commit_error_reports_exactly_the_persisted_partial_result() {
+    let p = seed(Arc::new(Probe::atomic())).await;
+    let proc = processor(p.clone());
+    let second = patch(&proc, vec![mutation(OLD, true, 2), mutation(NEW, false, 2)]).await;
+    let reference = processor(seeded().await);
+    reference
+        .process_patch_list(list(vec![second.clone()]), true)
+        .await
+        .unwrap();
+    let third = patch(&reference, vec![mutation(NEW, false, 3)]).await;
+    p.fail_write.store(5, Ordering::SeqCst);
+    let error = proc
+        .process_patch_list(list(vec![second, third.clone()]), true)
+        .await
+        .unwrap_err();
+    let (mutations, committed, collection, cause) = error
+        .downcast::<CommittedMutationsError>()
+        .unwrap()
+        .into_parts();
+    assert_eq!(mutations.len(), 2);
+    assert_eq!(committed.version, 2);
+    assert_eq!(collection, WAPatchName::Regular);
+    assert!(matches!(
+        cause.downcast_ref::<StoreError>(),
+        Some(StoreError::Validation(_))
+    ));
+    let held = p.get_version("regular").await.unwrap().unwrap();
+    assert_eq!(held.version, committed.version);
+    assert_eq!(held.hash, committed.hash);
+    drop(proc);
+    p.fail_write.store(0, Ordering::SeqCst);
+    let (mutations, state, _) = processor(p)
+        .process_patch_list(list(vec![third]), true)
+        .await
+        .unwrap();
+    assert_eq!(mutations.len(), 1);
+    assert_eq!(state.version, 3);
+    assert!(!state.mac_mismatch_fatal);
+}
+
+/// Atomicity prevents torn MAC state; it cannot promise delivery after a later
+/// durability error. Keep this limitation explicit while preserving the error.
+#[tokio::test]
+async fn atomic_post_commit_error_still_requires_delivery_recovery() {
+    let p = seed(Arc::new(Probe::atomic())).await;
+    let proc = processor(p.clone());
+    let second = patch(&proc, vec![mutation(OLD, true, 2), mutation(NEW, false, 2)]).await;
+    p.fail_after_commit.store(true, Ordering::SeqCst);
+    let error = proc
+        .process_patch_list(list(vec![second.clone()]), true)
+        .await
+        .unwrap_err();
+    assert!(error.downcast_ref::<CommittedMutationsError>().is_none());
+    assert!(matches!(
+        error.downcast_ref::<StoreError>(),
+        Some(StoreError::Validation(_))
+    ));
+    assert_eq!(p.get_version("regular").await.unwrap().unwrap().version, 2);
+    assert!(
+        p.get_mutation_mac("regular", &index_mac(OLD))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        p.get_mutation_mac("regular", &index_mac(NEW))
+            .await
+            .unwrap()
+            .is_some()
+    );
+    drop(proc);
+    p.fail_after_commit.store(false, Ordering::SeqCst);
+    let restarted = processor(p);
+    let error = restarted
+        .process_patch_list(list(vec![second]), true)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "patch version mismatch: expected 3, got 2"
+    );
+    let third = patch(&restarted, vec![mutation(NEW, false, 3)]).await;
+    let (_, state, _) = restarted
+        .process_patch_list(list(vec![third]), true)
+        .await
+        .unwrap();
+    assert!(
+        !state.mac_mismatch_fatal,
+        "the complete MAC set survived the error"
     );
 }
