@@ -5344,10 +5344,13 @@ dependencies = [
  "buffa-descriptor",
  "bytes",
  "heck",
+ "prettyplease 0.2.37",
+ "quote",
  "serde",
  "serde_json",
  "serde_repr",
  "sha2 0.11.0",
+ "syn 2.0.119",
 ]
 
 [[package]]
