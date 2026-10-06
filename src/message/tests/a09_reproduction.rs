@@ -124,6 +124,45 @@ impl Fixture {
         }
     }
 
+    async fn restart(&mut self) {
+        use crate::socket::NoiseSocket;
+        use crate::transport::mock::CapturingMockTransportFactory;
+        use wacore::handshake::NoiseCipher;
+        let backend = self.client.persistence_manager.backend();
+        let pm = Arc::new(PersistenceManager::new(backend).await.unwrap());
+        let factory = CapturingMockTransportFactory::new();
+        let transport = factory.transport();
+        let (client, _) = Client::builder()
+            .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+            .with_persistence_manager(pm)
+            .with_transport_factory_arc(Arc::new(factory))
+            .with_http_client_arc(Arc::new(MockHttpClient))
+            .build()
+            .await
+            .unwrap()
+            .into_parts();
+        seed_test_pn(&client).await;
+        client.enter_live_mode_for_tests();
+        client.set_connected_for_test(true);
+        *client.noise_socket.lock().unwrap() = Some(Arc::new(NoiseSocket::new(
+            client.runtime.clone(),
+            transport.clone(),
+            NoiseCipher::new(&[0; 32]).unwrap(),
+            NoiseCipher::new(&[0; 32]).unwrap(),
+        )));
+        client
+            .inbound_durability_hook
+            .set(self.hook.clone())
+            .ok()
+            .unwrap();
+        let (handler, events) = ChannelEventHandler::new();
+        client.core.event_bus.subscribe_handler(handler).detach();
+        self.client = client;
+        self.transport = transport;
+        self.events = events;
+        self.hook.attempts.store(0, Ordering::SeqCst);
+    }
+
     fn buffer_failure(&mut self, enabled: bool) {
         let query = if enabled {
             "CREATE TRIGGER fail_pending BEFORE INSERT ON pending_inbound_messages BEGIN SELECT RAISE(FAIL, 'synthetic pending write failure'); END"
@@ -904,9 +943,6 @@ async fn p1_group_parts(
     )
 }
 async fn p1_restart_parts(bodies: &[&str]) {
-    use crate::socket::NoiseSocket;
-    use crate::transport::mock::CapturingMockTransportFactory;
-    use wacore::handshake::NoiseCipher;
     let mut f = Fixture::new("P1_RESTART", false).await;
     let group: Jid = "120363000000000021@g.us".parse().unwrap();
     let mut peer = joined_group_sender(&f.client, "100000000000021:75@lid", &group).await;
@@ -916,39 +952,7 @@ async fn p1_restart_parts(bodies: &[&str]) {
     f.receive().await;
     assert_eq!(f.hook.attempts.load(Ordering::SeqCst), bodies.len());
     let original = f.pending().await.unwrap();
-    let backend = f.client.persistence_manager.backend();
-    let pm = Arc::new(PersistenceManager::new(backend).await.unwrap());
-    let factory = CapturingMockTransportFactory::new();
-    let transport = factory.transport();
-    let (client, _) = Client::builder()
-        .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
-        .with_persistence_manager(pm)
-        .with_transport_factory_arc(Arc::new(factory))
-        .with_http_client_arc(Arc::new(MockHttpClient))
-        .build()
-        .await
-        .unwrap()
-        .into_parts();
-    seed_test_pn(&client).await;
-    client.enter_live_mode_for_tests();
-    client.set_connected_for_test(true);
-    *client.noise_socket.lock().unwrap() = Some(Arc::new(NoiseSocket::new(
-        client.runtime.clone(),
-        transport.clone(),
-        NoiseCipher::new(&[0; 32]).unwrap(),
-        NoiseCipher::new(&[0; 32]).unwrap(),
-    )));
-    client
-        .inbound_durability_hook
-        .set(f.hook.clone())
-        .ok()
-        .unwrap();
-    let (handler, events) = ChannelEventHandler::new();
-    client.core.event_bus.subscribe_handler(handler).detach();
-    f.client = client;
-    f.transport = transport;
-    f.events = events;
-    f.hook.attempts.store(0, Ordering::SeqCst);
+    f.restart().await;
     f.stanza = p1_group_parts(&mut peer, &group, &f.info.id, bodies).await;
     f.receive().await;
     assert_eq!(
@@ -1044,4 +1048,349 @@ async fn p1_two_reconnects_after_hook_failure_keep_retrying() {
 #[tokio::test]
 async fn p1_two_reconnects_after_hook_cancellation_keep_retrying() {
     p1_two_reconnects(true).await;
+}
+
+fn with_participant(stanza: &OwnedNodeRef, participant: &Jid) -> Arc<OwnedNodeRef> {
+    let mut node = stanza.to_owned_node();
+    node.attrs.insert("participant", participant.clone());
+    node_to_arc(node)
+}
+
+async fn restart_participant_alias(first_device: bool, multiple_rows: bool) {
+    let mut f = Fixture::new("RESTART_ALIAS", false).await;
+    let group: Jid = "120363000000000024@g.us".parse().unwrap();
+    let mut peer = joined_group_sender(&f.client, "100000000000024:75@lid", &group).await;
+    let bare = peer.jid.to_non_ad();
+    let (first, second) = if first_device {
+        (peer.jid.clone(), bare)
+    } else {
+        (bare, peer.jid.clone())
+    };
+    let original_stanza = p1_group_parts(&mut peer, &group, &f.info.id, &["A", "A", "B"]).await;
+    f.stanza = with_participant(&original_stanza, &first);
+    f.info = f.client.parse_message_info(f.stanza.get()).await.unwrap();
+    f.hook.fail.store(true, Ordering::SeqCst);
+    f.receive().await;
+    let original = f.pending().await.unwrap();
+    let backend = f.client.persistence_manager.backend();
+    let chat = group.to_string();
+    let id = f.info.id.to_string();
+    let extra_sender = "100000000000024:76@lid";
+    let foreign_sender = "100000000000024@s.whatsapp.net";
+    let foreign_bytes = b"\0unsupported-foreign-envelope";
+    backend
+        .store_pending_inbound(&chat, foreign_sender, &id, foreign_bytes)
+        .await
+        .unwrap();
+    if multiple_rows {
+        backend
+            .store_pending_inbound(&chat, &second.to_string(), &id, &original)
+            .await
+            .unwrap();
+        let mut extra = wa::Message::default();
+        extra.conversation = Some("C".into());
+        let mut bytes = Vec::new();
+        waproto::codec::message_encode_into(&extra, &mut bytes);
+        backend
+            .store_pending_inbound(&chat, extra_sender, &id, &bytes)
+            .await
+            .unwrap();
+    }
+    f.restart().await;
+    f.stanza = with_participant(&original_stanza, &second); // identical ciphertext
+    f.receive().await;
+    let expected = if multiple_rows {
+        vec!["A", "A", "B", "C"]
+    } else {
+        vec!["A", "A", "B"]
+    };
+    assert_eq!(
+        f.receipts(),
+        0,
+        "a restart cannot acknowledge an uncommitted sender alias"
+    );
+    assert_eq!(f.hook.attempts.load(Ordering::SeqCst), expected.len());
+    assert_eq!(
+        backend
+            .get_pending_inbound(&chat, &first.to_string(), &id)
+            .await
+            .unwrap()
+            .unwrap(),
+        original
+    );
+    f.hook.fail.store(false, Ordering::SeqCst);
+    f.receive().await;
+    assert_eq!(f.hook.committed.load(Ordering::SeqCst), expected.len());
+    assert_eq!(f.published(), expected);
+    assert!(f.receipts() > 0);
+    for sender in [
+        first.to_string(),
+        second.to_string(),
+        extra_sender.to_owned(),
+    ] {
+        assert!(
+            backend
+                .get_pending_inbound(&chat, &sender, &id)
+                .await
+                .unwrap()
+                .is_none(),
+            "committed alias must be settled: {sender}"
+        );
+    }
+    assert_eq!(
+        backend
+            .get_pending_inbound(&chat, foreign_sender, &id)
+            .await
+            .unwrap()
+            .unwrap(),
+        foreign_bytes
+    );
+    assert_eq!(f.client.inbound_commit_batch.retention.stats(), (0, 0));
+}
+#[tokio::test]
+async fn restart_alias_device_to_bare_replays_before_receipt() {
+    restart_participant_alias(true, false).await;
+}
+#[tokio::test]
+async fn restart_alias_bare_to_device_replays_before_receipt() {
+    restart_participant_alias(false, false).await;
+}
+#[tokio::test]
+async fn restart_alias_multiple_rows_preserve_parts_and_settle_all_keys() {
+    restart_participant_alias(true, true).await;
+}
+
+#[tokio::test]
+async fn restart_alias_corruption_withholds_receipt_until_matching_rows_are_repaired() {
+    let mut f = Fixture::new("RESTART_CORRUPT_ALIAS", false).await;
+    let group: Jid = "120363000000000025@g.us".parse().unwrap();
+    let mut peer = joined_group_sender(&f.client, "100000000000025:75@lid", &group).await;
+    f.stanza = p1_group_parts(&mut peer, &group, &f.info.id, &["A", "A"]).await;
+    f.info = f.client.parse_message_info(f.stanza.get()).await.unwrap();
+    f.hook.fail.store(true, Ordering::SeqCst);
+    f.receive().await;
+    let original = f.pending().await.unwrap();
+    let backend = f.client.persistence_manager.backend();
+    let chat = group.to_string();
+    let id = f.info.id.to_string();
+    let alias = peer.jid.to_non_ad().to_string();
+    let corrupt = b"\0WAPI\x02future-version";
+    backend
+        .store_pending_inbound(&chat, &alias, &id, corrupt)
+        .await
+        .unwrap();
+    f.restart().await;
+    f.stanza = with_participant(&f.stanza, &peer.jid.to_non_ad());
+    f.receive().await;
+    assert_eq!(f.receipts(), 0);
+    assert_eq!(f.hook.attempts.load(Ordering::SeqCst), 0);
+    assert_eq!(f.pending().await.unwrap(), original);
+    assert_eq!(
+        backend
+            .get_pending_inbound(&chat, &alias, &id)
+            .await
+            .unwrap()
+            .unwrap(),
+        corrupt
+    );
+    // Explicit fixture repair, never an SDK rewrite/delete of unknown bytes.
+    backend
+        .store_pending_inbound(&chat, &alias, &id, &original)
+        .await
+        .unwrap();
+    f.hook.fail.store(false, Ordering::SeqCst);
+    f.receive().await;
+    assert_eq!(f.hook.committed.load(Ordering::SeqCst), 2);
+    assert_eq!(f.published(), ["A", "A"]);
+    assert_eq!(f.receipts(), 1);
+    assert!(
+        backend
+            .get_pending_inbound_for_message(&chat, &id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(f.client.inbound_commit_batch.retention.stats(), (0, 0));
+}
+
+#[tokio::test]
+async fn restart_alias_conflicting_part_order_preserves_both_records() {
+    let mut f = Fixture::new("RESTART_ORDER_ALIAS", false).await;
+    let group: Jid = "120363000000000026@g.us".parse().unwrap();
+    let mut peer = joined_group_sender(&f.client, "100000000000026:75@lid", &group).await;
+    f.stanza = p1_group_parts(&mut peer, &group, &f.info.id, &["A", "B"]).await;
+    f.info = f.client.parse_message_info(f.stanza.get()).await.unwrap();
+    f.hook.fail.store(true, Ordering::SeqCst);
+    f.receive().await;
+    let original = f.pending().await.unwrap();
+    let backend = f.client.persistence_manager.backend();
+    let chat = group.to_string();
+    let id = f.info.id.to_string();
+    let alias = peer.jid.to_non_ad().to_string();
+    let reversed: Vec<Vec<u8>> = durability::decode_pending_parts(&original)
+        .unwrap()
+        .into_iter()
+        .rev()
+        .map(|message| {
+            let mut bytes = Vec::new();
+            waproto::codec::message_encode_into(&message, &mut bytes);
+            bytes
+        })
+        .collect();
+    let reversed =
+        durability::encode_pending_parts(&reversed.iter().map(Vec::as_slice).collect::<Vec<_>>());
+    backend
+        .store_pending_inbound(&chat, &alias, &id, &reversed)
+        .await
+        .unwrap();
+    f.restart().await;
+    f.stanza = with_participant(&f.stanza, &peer.jid.to_non_ad());
+    f.receive().await;
+    assert_eq!(f.receipts(), 0);
+    assert_eq!(f.hook.attempts.load(Ordering::SeqCst), 0);
+    assert_eq!(f.pending().await.unwrap(), original);
+    assert_eq!(
+        backend
+            .get_pending_inbound(&chat, &alias, &id)
+            .await
+            .unwrap()
+            .unwrap(),
+        reversed
+    );
+    assert_eq!(f.client.inbound_commit_batch.retention.stats(), (0, 0));
+}
+
+#[tokio::test]
+async fn pending_lookup_in_a_dm_does_not_merge_sender_devices() {
+    let f = Fixture::new("DIRECT_DEVICE_BOUNDARY", false).await;
+    let backend = f.client.persistence_manager.backend();
+    let chat = f.info.source.chat.to_string();
+    let sender = f.info.source.sender.to_string();
+    let other = f.info.source.sender.to_non_ad().to_string();
+    assert_ne!(sender, other);
+    let mut message = wa::Message::default();
+    message.conversation = Some("exact device only".into());
+    let mut bytes = Vec::new();
+    waproto::codec::message_encode_into(&message, &mut bytes);
+    backend
+        .store_pending_inbound(&chat, &sender, &f.info.id, &bytes)
+        .await
+        .unwrap();
+    backend
+        .store_pending_inbound(&chat, &other, &f.info.id, b"\0unreadable other device")
+        .await
+        .unwrap();
+    let replay = f
+        .client
+        .load_pending_inbound(&Arc::new(f.info.clone()))
+        .await
+        .unwrap();
+    assert_eq!(replay.items.len(), 1);
+    assert_eq!(
+        replay.items[0].message.conversation.as_deref(),
+        Some("exact device only")
+    );
+    assert_eq!(replay.keys, [(chat.clone(), sender, f.info.id.to_string())]);
+    assert_eq!(
+        backend
+            .get_pending_inbound(&chat, &other, &f.info.id)
+            .await
+            .unwrap()
+            .unwrap(),
+        b"\0unreadable other device"
+    );
+}
+
+async fn restart_contained_alias(bodies: &[&str], exact: &[&str], extra_prefix: bool) {
+    let mut f = Fixture::new("RESTART_CONTAINED_ALIAS", false).await;
+    let group: Jid = "120363000000000029@g.us".parse().unwrap();
+    let mut peer = joined_group_sender(&f.client, "100000000000029:75@lid", &group).await;
+    f.stanza = p1_group_parts(&mut peer, &group, &f.info.id, bodies).await;
+    f.info = f.client.parse_message_info(f.stanza.get()).await.unwrap();
+    f.hook.fail.store(true, Ordering::SeqCst);
+    f.receive().await;
+    let original = f.pending().await.unwrap();
+    let backend = f.client.persistence_manager.backend();
+    let chat = group.to_string();
+    let id = f.info.id.to_string();
+    let alias = peer.jid.to_non_ad().to_string();
+    let recorded = durability::decode_pending_parts(&original).unwrap();
+    let encode = |parts: &[&str]| {
+        let bytes: Vec<Vec<u8>> = parts
+            .iter()
+            .map(|body| {
+                // Reuse every wire field, including the fixture's unknown field.
+                let message = recorded
+                    .iter()
+                    .find(|message| message.conversation.as_deref() == Some(*body))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                waproto::codec::message_encode_into(message, &mut bytes);
+                bytes
+            })
+            .collect();
+        if bytes.len() == 1 {
+            bytes[0].clone()
+        } else {
+            durability::encode_pending_parts(&bytes.iter().map(Vec::as_slice).collect::<Vec<_>>())
+        }
+    };
+    let exact_bytes = encode(exact);
+    backend
+        .store_pending_inbound(&chat, &alias, &id, &exact_bytes)
+        .await
+        .unwrap();
+    let extra = "100000000000029:76@lid";
+    if extra_prefix {
+        backend
+            .store_pending_inbound(&chat, extra, &id, &encode(&bodies[..1]))
+            .await
+            .unwrap();
+    }
+    f.restart().await;
+    f.stanza = with_participant(&f.stanza, &peer.jid.to_non_ad());
+    f.receive().await;
+    assert_eq!(
+        f.hook.attempts.load(Ordering::SeqCst),
+        bodies.len(),
+        "a complete compatible alias must replay in its recorded order"
+    );
+    assert_eq!(f.receipts(), 0);
+    assert_eq!(f.pending().await.unwrap(), original);
+    let extended = backend
+        .get_pending_inbound(&chat, &alias, &id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        durability::decode_pending_parts(&extended)
+            .unwrap()
+            .iter()
+            .map(|message| message.conversation.as_deref().unwrap())
+            .collect::<Vec<_>>(),
+        bodies
+    );
+    f.hook.fail.store(false, Ordering::SeqCst);
+    f.receive().await;
+    assert_eq!(f.hook.committed.load(Ordering::SeqCst), bodies.len());
+    assert_eq!(f.published(), bodies);
+    assert_eq!(f.receipts(), 1);
+    for sender in [peer.jid.to_string(), alias, extra.to_owned()] {
+        assert!(
+            backend
+                .get_pending_inbound(&chat, &sender, &id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+    assert_eq!(f.client.inbound_commit_batch.retention.stats(), (0, 0));
+}
+#[tokio::test]
+async fn restart_contained_alias_exact_tail_uses_complete_recorded_sequence() {
+    restart_contained_alias(&["A", "B"], &["B"], false).await;
+}
+#[tokio::test]
+async fn restart_contained_alias_preserves_repeated_parts_and_all_keys() {
+    restart_contained_alias(&["A", "A", "B"], &["A", "B"], true).await;
 }

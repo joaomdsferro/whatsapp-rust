@@ -50,7 +50,7 @@ impl Drop for InboundAdmission {
 enum State {
     Collecting,
     Batched,
-    Committing,
+    Committing(u64),
     Retry,
     Scheduled,
 }
@@ -59,41 +59,45 @@ struct Stanza {
     items: Vec<InboundMessage>,
     // Parts produced by this delivery, distinct from retained/replayed parts.
     fresh: Vec<InboundMessage>,
+    pending_keys: Vec<Key>,
     state: State,
     receipt: bool,
     ticket: Option<InboundCommitTicket>,
     admissions: Vec<Arc<InboundAdmission>>,
     commit_waiters: Vec<futures::channel::oneshot::Sender<()>>,
 }
+// Match occurrences, not a set: [A,A] remains two parts, but another
+// delivery of [A,A] contributes no additional copies. Reuse dispatch's SKDM
+// equivalence without copying the protobuf schema or dropping unknown fields.
+pub(super) fn merge_parts(items: &mut Vec<InboundMessage>, fresh: Vec<InboundMessage>) {
+    if items.is_empty() {
+        *items = fresh;
+        return;
+    }
+    let mut prior = HashMap::<DispatchFingerprint, usize>::new();
+    let mut scratch = Vec::new();
+    for item in items.iter() {
+        *prior
+            .entry(MessageDispatch::fingerprint_into(
+                &item.message,
+                &mut scratch,
+            ))
+            .or_default() += 1;
+    }
+    for item in fresh {
+        let fingerprint = MessageDispatch::fingerprint_into(&item.message, &mut scratch);
+        if let Some(count) = prior.get_mut(&fingerprint)
+            && *count != 0
+        {
+            *count -= 1;
+        } else {
+            items.push(item);
+        }
+    }
+}
 impl Stanza {
     fn reconcile(&mut self) {
-        if self.items.is_empty() {
-            self.items = std::mem::take(&mut self.fresh);
-            return;
-        }
-        // Match occurrences, not a set of contents: [A,A] remains two parts,
-        // while another delivery of [A,A] contributes no additional copies.
-        // Reuse the dispatch fingerprint's established SKDM equivalence.
-        let mut prior = HashMap::<DispatchFingerprint, usize>::new();
-        let mut scratch = Vec::new();
-        for item in &self.items {
-            *prior
-                .entry(MessageDispatch::fingerprint_into(
-                    &item.message,
-                    &mut scratch,
-                ))
-                .or_default() += 1;
-        }
-        for item in self.fresh.drain(..) {
-            let fingerprint = MessageDispatch::fingerprint_into(&item.message, &mut scratch);
-            if let Some(count) = prior.get_mut(&fingerprint)
-                && *count != 0
-            {
-                *count -= 1;
-            } else {
-                self.items.push(item);
-            }
-        }
+        merge_parts(&mut self.items, std::mem::take(&mut self.fresh));
     }
 }
 #[derive(Default)]
@@ -162,7 +166,7 @@ impl InboundRetention {
         self.active.store(true, Ordering::Release);
         let mut stanzas = lock(&self.stanzas);
         if let Some(stanza) = stanzas.get_mut(&key(info))
-            && stanza.state == State::Committing
+            && matches!(stanza.state, State::Committing(_))
         {
             let (wake, wait) = futures::channel::oneshot::channel();
             stanza.commit_waiters.push(wake);
@@ -183,6 +187,7 @@ impl InboundRetention {
                 id,
                 items: Vec::new(),
                 fresh: Vec::new(),
+                pending_keys: Vec::new(),
                 state: State::Collecting,
                 receipt: false,
                 ticket: None,
@@ -244,12 +249,27 @@ impl InboundRetention {
             id,
         }
     }
-    pub(crate) fn seed_replay(&self, items: Vec<InboundMessage>) {
-        let Some(first) = items.first() else { return };
+    pub(crate) fn replay_items(&self, info: &MessageInfo) -> Option<Arc<[InboundMessage]>> {
+        let stanzas = lock(&self.stanzas);
+        let stanza = stanzas.get(&key(info))?;
+        (!matches!(stanza.state, State::Collecting | State::Committing(_)))
+            .then(|| stanza.items.clone().into())
+    }
+    pub(crate) fn is_collecting(&self, info: &MessageInfo) -> bool {
+        lock(&self.stanzas)
+            .get(&key(info))
+            .is_some_and(|s| s.state == State::Collecting)
+    }
+    pub(super) fn seed_replay(&self, replay: durability::PendingReplay) {
+        let Some(first) = replay.items.first() else {
+            return;
+        };
         let mut stanzas = lock(&self.stanzas);
         if let Some(stanza) = stanzas.get_mut(&key(&first.info)) {
-            debug_assert!(stanza.items.is_empty());
-            stanza.items = items;
+            merge_parts(&mut stanza.items, replay.items);
+            stanza.pending_keys.extend(replay.keys);
+            stanza.pending_keys.sort();
+            stanza.pending_keys.dedup();
         }
     }
     pub(crate) fn seal(&self, info: &MessageInfo, draining: bool) -> (Arc<[InboundMessage]>, bool) {
@@ -270,16 +290,26 @@ impl InboundRetention {
         };
         (stanza.items.clone().into(), false)
     }
-    pub(crate) fn batched(&self, items: &[InboundMessage]) {
+    pub(crate) fn batched(&self, items: &[InboundMessage], owner: Option<&RetentionCommit>) {
         let mut stanzas = lock(&self.stanzas);
         for item in items {
-            if let Some(stanza) = stanzas.get_mut(&key(&item.info))
-                && stanza.state != State::Collecting
-            {
-                // An older snapshot may be restored while a newer producer
-                // extends this identity after a connection reset.
-                stanza.state = State::Batched;
+            let key = key(&item.info);
+            let Some(stanza) = stanzas.get_mut(&key) else {
+                continue;
+            };
+            match stanza.state {
+                State::Collecting => continue,
+                State::Committing(_) => {
+                    if !owner.is_some_and(|owner| owner.owns_stanza(&key, stanza)) {
+                        continue;
+                    }
+                    // Publishing the restored stanza relinquishes this commit.
+                    // A later Drop/complete must not affect a successor owner.
+                    stanza.commit_waiters.clear();
+                }
+                _ => {}
             }
+            stanza.state = State::Batched;
         }
     }
     pub(crate) fn commit(self: &Arc<Self>, items: &[InboundMessage]) -> Option<RetentionCommit> {
@@ -287,6 +317,7 @@ impl InboundRetention {
             return Some(RetentionCommit {
                 retention: Arc::clone(self),
                 keys: Vec::new(),
+                id: 0,
                 complete: false,
                 _admissions: Vec::new(),
             });
@@ -299,14 +330,17 @@ impl InboundRetention {
                 continue;
             }
             if let Some(stanza) = stanzas.get(&key) {
-                if matches!(stanza.state, State::Committing | State::Collecting) {
+                if matches!(stanza.state, State::Committing(_) | State::Collecting) {
                     return None;
                 }
                 keys.push(key);
             }
         }
+        // A restored entry can be committed again without a new producer.
+        // Give each acquisition its own authority over Drop and completion.
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         for key in &keys {
-            stanzas.get_mut(key).expect("key checked under lock").state = State::Committing;
+            stanzas.get_mut(key).expect("key checked under lock").state = State::Committing(id);
         }
         let admissions = keys
             .iter()
@@ -315,6 +349,7 @@ impl InboundRetention {
         Some(RetentionCommit {
             retention: Arc::clone(self),
             keys,
+            id,
             complete: false,
             _admissions: admissions,
         })
@@ -406,12 +441,19 @@ impl Drop for RetryAttempt {
 pub(crate) struct RetentionCommit {
     retention: Arc<InboundRetention>,
     keys: Vec<Key>,
+    id: u64,
     complete: bool,
     _admissions: Vec<Arc<InboundAdmission>>,
 }
 impl RetentionCommit {
+    fn owns_stanza(&self, key: &Key, stanza: &Stanza) -> bool {
+        stanza.state == State::Committing(self.id) && self.keys.contains(key)
+    }
     pub(crate) fn owns(&self, info: &MessageInfo) -> bool {
-        self.keys.contains(&key(info))
+        let key = key(info);
+        lock(&self.retention.stanzas)
+            .get(&key)
+            .is_some_and(|stanza| self.owns_stanza(&key, stanza))
     }
     pub(crate) fn canonical_items(&self, items: Arc<[InboundMessage]>) -> Arc<[InboundMessage]> {
         if self.keys.is_empty() {
@@ -422,15 +464,29 @@ impl RetentionCommit {
         let mut canonical = Vec::new();
         for item in items.iter() {
             let key = key(&item.info);
-            if self.keys.contains(&key) {
+            if let Some(stanza) = stanzas.get(&key)
+                && self.owns_stanza(&key, stanza)
+            {
                 if emitted.insert(key.clone()) {
-                    canonical.extend_from_slice(&stanzas[&key].items);
+                    canonical.extend_from_slice(&stanza.items);
                 }
             } else {
                 canonical.push(item.clone());
             }
         }
         canonical.into()
+    }
+    pub(crate) fn pending_keys(&self) -> Vec<(String, String, String)> {
+        let stanzas = lock(&self.retention.stanzas);
+        self.keys
+            .iter()
+            .filter_map(|key| {
+                stanzas
+                    .get(key)
+                    .filter(|stanza| self.owns_stanza(key, stanza))
+            })
+            .flat_map(|stanza| stanza.pending_keys.iter().cloned())
+            .collect()
     }
     pub(crate) fn durable(&self) {
         if self.keys.is_empty() {
@@ -439,6 +495,7 @@ impl RetentionCommit {
         let mut stanzas = lock(&self.retention.stanzas);
         for key in &self.keys {
             if let Some(stanza) = stanzas.get_mut(key)
+                && self.owns_stanza(key, stanza)
                 && let Some(ticket) = stanza.ticket.take()
             {
                 ticket.mark_durable();
@@ -447,15 +504,18 @@ impl RetentionCommit {
     }
     pub(crate) fn complete(&mut self) {
         self.complete = true;
-        if self.keys.is_empty() {
-            return;
-        }
-        self.durable();
         let mut stanzas = lock(&self.retention.stanzas);
         for key in &self.keys {
-            stanzas.remove(key);
+            if stanzas
+                .get(key)
+                .is_some_and(|stanza| self.owns_stanza(key, stanza))
+            {
+                let mut stanza = stanzas.remove(key).expect("owner checked under lock");
+                if let Some(ticket) = stanza.ticket.take() {
+                    ticket.mark_durable();
+                }
+            }
         }
-        self.complete = true;
     }
 }
 impl Drop for RetentionCommit {
@@ -465,12 +525,10 @@ impl Drop for RetentionCommit {
         }
         let mut stanzas = lock(&self.retention.stanzas);
         for key in &self.keys {
-            if let Some(stanza) = stanzas.get_mut(key) {
-                // A cancelled drain first restores its batch. Keep that
-                // state; otherwise the resident retry owns the next attempt.
-                if stanza.state == State::Committing {
-                    stanza.state = State::Retry;
-                }
+            if let Some(stanza) = stanzas.get_mut(key)
+                && self.owns_stanza(key, stanza)
+            {
+                stanza.state = State::Retry;
                 stanza.commit_waiters.clear();
             }
         }
@@ -766,6 +824,101 @@ mod tests {
         assert!(retention.retry_items().is_empty());
     }
     #[tokio::test]
+    async fn completed_guard_drop_cannot_remove_a_newer_collection() {
+        let retention = Arc::new(InboundRetention::default());
+        let first = item("same", "old");
+        retention.begin(&first.info, retention.admit(100)).await;
+        retention
+            .stage(std::slice::from_ref(&first), false)
+            .unwrap();
+        let (items, _) = retention.seal(&first.info, false);
+        let mut old = retention.commit(&items).unwrap();
+        old.complete();
+        retention.begin(&first.info, retention.admit(200)).await;
+        retention.stage(&[item("same", "new")], false).unwrap();
+        drop(old);
+        assert_eq!(retention.stats(), (1, 200));
+        let (new, _) = retention.seal(&first.info, false);
+        assert_eq!(new.len(), 1);
+        assert_eq!(new[0].message.conversation.as_deref(), Some("new"));
+        let mut commit = retention.commit(&new).unwrap();
+        commit.complete();
+        drop(commit);
+        assert_eq!(retention.stats(), (0, 0));
+    }
+    async fn restored_owner_cannot_mutate_successor(complete_old: bool) {
+        let retention = Arc::new(InboundRetention::default());
+        let first = item("owner-handoff", "A");
+        retention.begin(&first.info, retention.admit(100)).await;
+        let Some(InboundCommitState::Deferred(Some(ticket))) =
+            retention.stage(std::slice::from_ref(&first), true)
+        else {
+            panic!("tracked stanza must retain its ticket")
+        };
+        let (items, _) = retention.seal(&first.info, true);
+        let mut old = retention.commit(&items).unwrap();
+        let mut admission = None;
+        let waiting_old = retention
+            .try_begin(&first.info, &mut admission)
+            .unwrap_err();
+        retention.batched(&items, Some(&old));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), waiting_old)
+                .await
+                .unwrap()
+                .is_err(),
+            "restoration must wake the relinquished owner's waiters"
+        );
+        let new = retention.commit(&items).unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let task = tokio::spawn({
+            let entered = entered.clone();
+            async move {
+                let _new = new;
+                entered.notify_one();
+                futures::future::pending::<()>().await;
+            }
+        });
+        entered.notified().await;
+        assert!(retention.commit(&items).is_none());
+        let mut admission = None;
+        let mut waiting = Box::pin(
+            retention
+                .try_begin(&first.info, &mut admission)
+                .unwrap_err(),
+        );
+        assert!(futures::poll!(waiting.as_mut()).is_pending());
+        old.durable();
+        assert_eq!(ticket.state(), InboundCommitTicketState::Pending);
+        if complete_old {
+            old.complete();
+        }
+        drop(old);
+        assert!(
+            retention.commit(&items).is_none(),
+            "a restored old owner must not release its successor"
+        );
+        assert_eq!(retention.stats(), (1, 100));
+        assert_eq!(ticket.state(), InboundCommitTicketState::Pending);
+        assert!(futures::poll!(waiting.as_mut()).is_pending());
+        task.abort(); // Cancellation must release only this owner for recovery.
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(waiting.await.is_err());
+        let mut retry = retention.commit(&items).unwrap();
+        retry.complete();
+        drop(retry);
+        assert_eq!(ticket.state(), InboundCommitTicketState::Durable);
+        assert_eq!(retention.stats(), (0, 0));
+    }
+    #[tokio::test]
+    async fn restored_owner_drop_cannot_release_a_new_commit() {
+        restored_owner_cannot_mutate_successor(false).await;
+    }
+    #[tokio::test]
+    async fn restored_owner_complete_cannot_remove_a_new_commit() {
+        restored_owner_cannot_mutate_successor(true).await;
+    }
+    #[tokio::test]
     async fn restoring_an_old_snapshot_does_not_seal_a_new_producer() {
         let retention = Arc::new(InboundRetention::default());
         let first = item("same-identity", "first");
@@ -776,7 +929,7 @@ mod tests {
         let (old_items, _) = retention.seal(&first.info, true);
         assert!(!retention.begin(&first.info, retention.admit(100)).await);
         assert!(retention.commit(&old_items).is_none());
-        retention.batched(&old_items);
+        retention.batched(&old_items, None);
         retention
             .stage(&[item("same-identity", "second")], false)
             .unwrap();
