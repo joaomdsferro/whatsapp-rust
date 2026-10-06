@@ -273,6 +273,34 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn pending_replay_preserves_distinct_parts_with_the_same_identity() {
+        let client = create_test_client_with_failing_http("durability_parts").await;
+        let hook = counting_hook(false);
+        let _ = client.inbound_durability_hook.set(hook.clone());
+        let first = test_item("MULTIPART");
+        let info = Arc::clone(&first.info);
+        let mut message = wa::Message::default();
+        message.conversation = Some("second distinct part".to_owned());
+        let second = InboundMessage::builder()
+            .message(Arc::new(message))
+            .info(Arc::clone(&info))
+            .build();
+        assert!(
+            client
+                .commit_inbound_batch(Arc::from([first, second]), BatchOrigin::OfflineDrain, None,)
+                .await
+        );
+        assert_eq!(hook.messages.swap(0, Ordering::SeqCst), 2);
+        hook.succeed.store(true, Ordering::SeqCst);
+        assert!(client.ack_or_replay_to_hook(&info).await);
+        assert_eq!(
+            hook.messages.load(Ordering::SeqCst),
+            2,
+            "replay must retain every distinct part of one message identity"
+        );
+    }
+
     // A genuine duplicate (no buffered copy) just acks without invoking the hook.
     #[tokio::test]
     async fn replay_without_buffer_just_acks() {
