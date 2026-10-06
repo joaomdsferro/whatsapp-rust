@@ -37,6 +37,9 @@ buffa-build = { workspace = true }
 buffa-descriptor = { workspace = true }
 heck = { workspace = true }
 sha2 = { workspace = true }
+syn = { version = "2", features = ["full", "visit-mut"] }
+quote = "1"
+prettyplease = "0.2"
 
 [dev-dependencies]
 serde_json = { workspace = true, features = ["std"] }
