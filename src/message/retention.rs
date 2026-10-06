@@ -1,0 +1,536 @@
+//! Client-owned plaintext and admission leases. Neither belongs to a socket generation.
+use super::*;
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use wacore::types::events::InboundMessage;
+
+// SDK admission policy, not a protocol limit or a measurement of decoded heap.
+const MAX_STANZAS: usize = 400;
+const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
+const RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
+type Key = (String, String, String);
+fn key(info: &MessageInfo) -> Key {
+    (
+        info.source.chat.to_string(),
+        info.source.sender.to_string(),
+        info.id.to_string(),
+    )
+}
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[derive(Default, Debug)]
+struct Budget {
+    count: usize,
+    bytes: usize,
+}
+#[derive(Debug)]
+pub(crate) struct InboundAdmission {
+    budget: Arc<Mutex<Budget>>,
+    bytes: usize,
+}
+impl Drop for InboundAdmission {
+    fn drop(&mut self) {
+        let mut budget = lock(&self.budget);
+        budget.count -= 1;
+        budget.bytes -= self.bytes;
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum State {
+    Collecting,
+    Batched,
+    Committing,
+    Retry,
+    Scheduled,
+}
+struct Stanza {
+    id: u64,
+    items: Vec<InboundMessage>,
+    state: State,
+    receipt: bool,
+    ticket: Option<InboundCommitTicket>,
+    admissions: Vec<Arc<InboundAdmission>>,
+}
+#[derive(Default)]
+pub(crate) struct InboundRetention {
+    budget: Arc<Mutex<Budget>>,
+    next_id: portable_atomic::AtomicU64,
+    stanzas: Mutex<HashMap<Key, Stanza>>,
+    chat_gates: Mutex<HashMap<String, std::sync::Weak<async_lock::Mutex<()>>>>,
+    active: AtomicBool,
+    worker_started: AtomicBool,
+    drain_retry: AtomicBool,
+}
+impl InboundRetention {
+    pub(crate) fn chat_gate(&self, info: &MessageInfo) -> Arc<async_lock::Mutex<()>> {
+        let mut gates = lock(&self.chat_gates);
+        gates.retain(|_, gate| gate.strong_count() != 0);
+        let entry = gates.entry(info.source.chat.to_string()).or_default();
+        if let Some(gate) = entry.upgrade() {
+            return gate;
+        }
+        let gate = Arc::new(async_lock::Mutex::new(()));
+        *entry = Arc::downgrade(&gate);
+        gate
+    }
+    pub(crate) fn admit(&self, bytes: usize) -> Option<InboundAdmission> {
+        let mut budget = lock(&self.budget);
+        // An otherwise empty budget admits one oversized frame. This preserves
+        // the transport's supported frame sizes without growing a queue of them.
+        if budget.count >= MAX_STANZAS
+            || (budget.count != 0 && bytes > MAX_FRAME_BYTES.saturating_sub(budget.bytes))
+        {
+            return None;
+        }
+        budget.count += 1;
+        budget.bytes += bytes;
+        Some(InboundAdmission {
+            budget: Arc::clone(&self.budget),
+            bytes,
+        })
+    }
+    pub(crate) fn stats(&self) -> (usize, usize) {
+        let budget = lock(&self.budget);
+        (budget.count, budget.bytes)
+    }
+    pub(crate) fn begin(&self, info: &MessageInfo, admission: Option<InboundAdmission>) -> bool {
+        self.active.store(true, Ordering::Release);
+        let mut stanzas = lock(&self.stanzas);
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        if let Some(stanza) = stanzas.get_mut(&key(info)) {
+            // The chat gate and processing permit exclude its commit. Preserve
+            // prior parts while a re-encrypted resend is examined for new parts.
+            stanza.id = id;
+            stanza.state = State::Collecting;
+            stanza.admissions.extend(admission.map(Arc::new));
+            return false;
+        }
+        stanzas.insert(
+            key(info),
+            Stanza {
+                id,
+                items: Vec::new(),
+                state: State::Collecting,
+                receipt: false,
+                ticket: None,
+                admissions: admission.map(Arc::new).into_iter().collect(),
+            },
+        );
+        true
+    }
+    pub(crate) fn stage(
+        &self,
+        items: &[InboundMessage],
+        track: bool,
+    ) -> Option<InboundCommitState> {
+        if !self.active.load(Ordering::Acquire) {
+            return None;
+        }
+        let first = items.first()?;
+        let mut stanzas = lock(&self.stanzas);
+        let stanza = stanzas.get_mut(&key(&first.info))?;
+        if stanza.state != State::Collecting {
+            return None;
+        }
+        stanza.items.extend_from_slice(items);
+        let ticket = track.then(|| {
+            stanza
+                .ticket
+                .get_or_insert_with(InboundCommitTicket::new)
+                .clone()
+        });
+        Some(InboundCommitState::Deferred(ticket))
+    }
+    pub(crate) fn defer_receipt(&self, info: &MessageInfo) -> bool {
+        if !self.active.load(Ordering::Acquire) {
+            return false;
+        }
+        let mut stanzas = lock(&self.stanzas);
+        if let Some(stanza) = stanzas.get_mut(&key(info))
+            && stanza.state == State::Collecting
+        {
+            stanza.receipt = true;
+            return true;
+        }
+        false
+    }
+    pub(crate) fn has_plaintext(&self, info: &MessageInfo) -> bool {
+        lock(&self.stanzas)
+            .get(&key(info))
+            .is_some_and(|s| !s.items.is_empty())
+    }
+    pub(crate) fn discard_empty(&self, info: &MessageInfo) {
+        let mut stanzas = lock(&self.stanzas);
+        if stanzas
+            .get(&key(info))
+            .is_some_and(|s| s.state == State::Collecting && s.items.is_empty())
+        {
+            stanzas.remove(&key(info));
+        }
+    }
+    pub(crate) fn seal(&self, info: &MessageInfo, draining: bool) -> (Arc<[InboundMessage]>, bool) {
+        let mut stanzas = lock(&self.stanzas);
+        let Some(stanza) = stanzas.get_mut(&key(info)) else {
+            return (Arc::from([]), false);
+        };
+        if stanza.items.is_empty() {
+            let receipt = stanza.receipt;
+            stanzas.remove(&key(info));
+            return (Arc::from([]), receipt);
+        }
+        stanza.state = if draining {
+            State::Batched
+        } else {
+            State::Retry
+        };
+        (stanza.items.clone().into(), false)
+    }
+    pub(crate) fn batched(&self, items: &[InboundMessage]) {
+        let mut stanzas = lock(&self.stanzas);
+        for item in items {
+            if let Some(stanza) = stanzas.get_mut(&key(&item.info)) {
+                stanza.state = State::Batched;
+            }
+        }
+    }
+    pub(crate) fn commit(self: &Arc<Self>, items: &[InboundMessage]) -> Option<RetentionCommit> {
+        if !self.active.load(Ordering::Acquire) {
+            return Some(RetentionCommit {
+                retention: Arc::clone(self),
+                keys: Vec::new(),
+                complete: false,
+                _admissions: Vec::new(),
+            });
+        }
+        let mut stanzas = lock(&self.stanzas);
+        let mut keys = Vec::new();
+        for item in items {
+            let key = key(&item.info);
+            if keys.contains(&key) {
+                continue;
+            }
+            if let Some(stanza) = stanzas.get(&key) {
+                if matches!(stanza.state, State::Committing | State::Collecting) {
+                    return None;
+                }
+                keys.push(key);
+            }
+        }
+        for key in &keys {
+            stanzas.get_mut(key).expect("key checked under lock").state = State::Committing;
+        }
+        let admissions = keys
+            .iter()
+            .flat_map(|key| stanzas[key].admissions.iter().cloned())
+            .collect();
+        Some(RetentionCommit {
+            retention: Arc::clone(self),
+            keys,
+            complete: false,
+            _admissions: admissions,
+        })
+    }
+    fn retry_one(self: &Arc<Self>, info: &MessageInfo) -> Option<RetryAttempt> {
+        let mut stanzas = lock(&self.stanzas);
+        let key = key(info);
+        let stanza = stanzas.get_mut(&key)?;
+        if stanza.state != State::Retry {
+            return None;
+        }
+        stanza.state = State::Scheduled;
+        Some(RetryAttempt::new(self, key, stanza))
+    }
+    fn retry_items(self: &Arc<Self>) -> Vec<RetryAttempt> {
+        let mut stanzas = lock(&self.stanzas);
+        stanzas
+            .iter_mut()
+            .filter_map(|(key, stanza)| {
+                if stanza.state != State::Retry {
+                    return None;
+                }
+                stanza.state = State::Scheduled;
+                Some(RetryAttempt::new(self, key.clone(), stanza))
+            })
+            .collect()
+    }
+}
+
+struct RetryAttempt {
+    retention: Arc<InboundRetention>,
+    key: Key,
+    id: u64,
+    items: Arc<[InboundMessage]>,
+    _admissions: Vec<Arc<InboundAdmission>>,
+}
+impl RetryAttempt {
+    fn new(retention: &Arc<InboundRetention>, key: Key, stanza: &Stanza) -> Self {
+        Self {
+            retention: Arc::clone(retention),
+            key,
+            id: stanza.id,
+            items: stanza.items.clone().into(),
+            _admissions: stanza.admissions.clone(),
+        }
+    }
+    fn is_current(&self) -> bool {
+        lock(&self.retention.stanzas)
+            .get(&self.key)
+            .is_some_and(|stanza| stanza.id == self.id && stanza.state == State::Scheduled)
+    }
+}
+impl Drop for RetryAttempt {
+    fn drop(&mut self) {
+        let mut stanzas = lock(&self.retention.stanzas);
+        if let Some(stanza) = stanzas.get_mut(&self.key)
+            && stanza.id == self.id
+            && stanza.state == State::Scheduled
+        {
+            stanza.state = State::Retry;
+        }
+    }
+}
+
+pub(crate) struct RetentionCommit {
+    retention: Arc<InboundRetention>,
+    keys: Vec<Key>,
+    complete: bool,
+    _admissions: Vec<Arc<InboundAdmission>>,
+}
+impl RetentionCommit {
+    pub(crate) fn durable(&self) {
+        if self.keys.is_empty() {
+            return;
+        }
+        let mut stanzas = lock(&self.retention.stanzas);
+        for key in &self.keys {
+            if let Some(stanza) = stanzas.get_mut(key)
+                && let Some(ticket) = stanza.ticket.take()
+            {
+                ticket.mark_durable();
+            }
+        }
+    }
+    pub(crate) fn complete(&mut self) {
+        self.complete = true;
+        if self.keys.is_empty() {
+            return;
+        }
+        self.durable();
+        let mut stanzas = lock(&self.retention.stanzas);
+        for key in &self.keys {
+            stanzas.remove(key);
+        }
+        self.complete = true;
+    }
+}
+impl Drop for RetentionCommit {
+    fn drop(&mut self) {
+        if self.complete || self.keys.is_empty() {
+            return;
+        }
+        let mut stanzas = lock(&self.retention.stanzas);
+        for key in &self.keys {
+            if let Some(stanza) = stanzas.get_mut(key) {
+                stanza.state = State::Retry;
+            }
+        }
+    }
+}
+
+impl Client {
+    pub(crate) fn admit_inbound_stanza(
+        &self,
+        node: &OwnedNodeRef,
+    ) -> Result<Option<InboundAdmission>, ()> {
+        if self.inbound_durability_hook().is_none()
+            || node
+                .attrs()
+                .optional_jid("from")
+                .is_some_and(|jid| jid.is_newsletter())
+        {
+            return Ok(None);
+        }
+        self.inbound_commit_batch
+            .retention
+            .admit(node.backing_bytes().len())
+            .map(Some)
+            .ok_or(())
+    }
+
+    pub(crate) async fn retry_retained_stanza(self: &Arc<Self>, info: &MessageInfo) {
+        let Some(attempt) = self.inbound_commit_batch.retention.retry_one(info) else {
+            return;
+        };
+        // Acquire the chat gate first: waiters for one slow chat must not
+        // consume all global slots and stall unrelated chats.
+        let _chat = self
+            .inbound_commit_batch
+            .retention
+            .chat_gate(info)
+            .lock_arc()
+            .await;
+        let _permit = self.acquire_message_processing_permit().await;
+        if attempt.is_current() {
+            self.commit_or_batch_inbound_items(Arc::clone(&attempt.items), false)
+                .await;
+        }
+    }
+
+    pub(crate) fn start_inbound_recovery(self: &Arc<Self>) {
+        if self
+            .inbound_commit_batch
+            .retention
+            .worker_started
+            .swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+        let weak = Arc::downgrade(self);
+        let runtime = self.runtime.clone();
+        self.runtime
+            .spawn(Box::pin(async move {
+                loop {
+                    runtime.sleep(RETRY_INTERVAL).await;
+                    let Some(client) = weak.upgrade() else {
+                        return;
+                    };
+                    if client.shutdown_signal().is_fired() {
+                        return;
+                    }
+                    let retention = &client.inbound_commit_batch.retention;
+                    if client.inbound_commit_batch.is_active()
+                        && client.inbound_commit_batch.has_entries()
+                        && !retention.drain_retry.swap(true, Ordering::AcqRel)
+                    {
+                        let client = Arc::clone(&client);
+                        client
+                            .clone()
+                            .runtime
+                            .spawn(Box::pin(async move {
+                                let _reset = scopeguard::guard(
+                                    Arc::clone(&client.inbound_commit_batch.retention),
+                                    |retention| {
+                                        retention.drain_retry.store(false, Ordering::Release);
+                                    },
+                                );
+                                let _ = client
+                                    .flush_inbound_commits_under_permit(false, None, None)
+                                    .await;
+                            }))
+                            .detach();
+                    }
+                    for attempt in retention.retry_items() {
+                        let client = Arc::clone(&client);
+                        client
+                            .clone()
+                            .runtime
+                            .spawn(Box::pin(async move {
+                                // The existing semaphore retains drain/live concurrency;
+                                // a slow hook does not own a separate global commit lock.
+                                let _chat = client
+                                    .inbound_commit_batch
+                                    .retention
+                                    .chat_gate(&attempt.items[0].info)
+                                    .lock_arc()
+                                    .await;
+                                let _permit = client.acquire_message_processing_permit().await;
+                                if attempt.is_current() {
+                                    client
+                                        .commit_or_batch_inbound_items(
+                                            Arc::clone(&attempt.items),
+                                            false,
+                                        )
+                                        .await;
+                                }
+                            }))
+                            .detach();
+                    }
+                }
+            }))
+            .detach();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn item(id: &str, body: &str) -> InboundMessage {
+        let mut message = wa::Message::default();
+        message.conversation = Some(body.to_owned());
+        let mut info = MessageInfo::default();
+        info.id = id.into();
+        InboundMessage::builder()
+            .message(Arc::new(message))
+            .info(Arc::new(info))
+            .build()
+    }
+    #[test]
+    fn admission_bounds_count_bytes_and_one_oversized_frame() {
+        let retention = InboundRetention::default();
+        let mut leases: Vec<_> = (0..MAX_STANZAS)
+            .map(|_| retention.admit(1).unwrap())
+            .collect();
+        assert!(retention.admit(1).is_none());
+        leases.pop();
+        assert!(retention.admit(1).is_some());
+        drop(leases);
+        assert_eq!(retention.stats(), (0, 0));
+        let full = retention.admit(MAX_FRAME_BYTES).unwrap();
+        assert!(retention.admit(1).is_none());
+        drop(full);
+        let oversized = retention.admit(MAX_FRAME_BYTES + 123).unwrap();
+        assert!(retention.admit(1).is_none());
+        drop(oversized);
+        assert_eq!(retention.stats(), (0, 0));
+    }
+    #[test]
+    fn cancelled_commit_and_retry_keep_parts_and_reservation() {
+        let retention = Arc::new(InboundRetention::default());
+        let first = item("multipart", "first");
+        let mut second = item("multipart", "second");
+        second.info = Arc::clone(&first.info);
+        assert!(retention.begin(&first.info, retention.admit(123)));
+        assert!(retention.defer_receipt(&first.info));
+        retention.stage(&[first.clone(), second], true).unwrap();
+        let (items, receipt) = retention.seal(&first.info, false);
+        assert!(!receipt);
+        assert_eq!(items.len(), 2);
+        drop(retention.commit(&items).unwrap());
+        assert_eq!(retention.stats(), (1, 123));
+        let attempt = retention.retry_one(&first.info).unwrap();
+        assert!(retention.retry_one(&first.info).is_none());
+        drop(attempt); // Cancellation while waiting for a processing permit.
+        let attempt = retention.retry_one(&first.info).unwrap();
+        let mut commit = retention.commit(&attempt.items).unwrap();
+        commit.complete();
+        drop(commit);
+        assert_eq!(
+            retention.stats(),
+            (1, 123),
+            "retry still owns its plaintext"
+        );
+        drop(attempt);
+        assert_eq!(retention.stats(), (0, 0));
+    }
+    #[test]
+    fn slow_commit_does_not_lock_unrelated_stanzas() {
+        let retention = Arc::new(InboundRetention::default());
+        let first = item("first", "first");
+        let second = item("second", "second");
+        for item in [&first, &second] {
+            assert!(retention.begin(&item.info, retention.admit(100)));
+            retention.stage(std::slice::from_ref(item), false).unwrap();
+            retention.seal(&item.info, false);
+        }
+        let stalled = retention.commit(&[first]).unwrap();
+        let mut independent = retention.commit(&[second]).unwrap();
+        independent.complete();
+        drop(independent);
+        assert_eq!(retention.stats(), (1, 100));
+        drop(stalled);
+    }
+}

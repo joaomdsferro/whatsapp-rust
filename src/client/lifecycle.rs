@@ -1433,7 +1433,10 @@ impl Client {
         // dropped, anything resident is state a failed teardown flush
         // deliberately retained (committed/acked, never redelivered) for the
         // next successful flush to persist.
-        if self.inbound_commit_batch.reset() {
+        if self
+            .inbound_commit_batch
+            .reset_for_reconnect(self.inbound_durability_hook().is_some())
+        {
             log::warn!(
                 "connect: dropping unflushed Signal state along with late uncommitted drain entries"
             );
@@ -2264,7 +2267,10 @@ impl Client {
         // redelivers them on the next connect. The cache falls with dropped
         // entries (rowless advances — including a timed-out settle's restored
         // batch); with nothing dropped it survives for the next flush.
-        if self.inbound_commit_batch.reset() {
+        if self
+            .inbound_commit_batch
+            .reset_for_reconnect(self.inbound_durability_hook().is_some())
+        {
             log::warn!(
                 "cleanup_connection_state: dropping unflushed Signal state along with late uncommitted drain entries"
             );
