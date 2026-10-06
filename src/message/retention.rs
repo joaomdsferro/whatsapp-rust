@@ -589,6 +589,34 @@ mod tests {
             .build()
     }
     #[test]
+    fn retention_identity_preserves_direct_devices_and_pn_lid_namespaces() {
+        fn info(chat: &str, sender: &str) -> MessageInfo {
+            MessageInfo {
+                id: "same-id".into(),
+                source: crate::types::message::MessageSource {
+                    chat: chat.parse().unwrap(),
+                    sender: sender.parse().unwrap(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }
+        }
+        let group = "120363000000001@g.us";
+        assert_eq!(
+            key(&info(group, "100000001:75@lid")),
+            key(&info(group, "100000001@lid"))
+        );
+        assert_ne!(
+            key(&info(group, "100000001@lid")),
+            key(&info(group, "100000001@s.whatsapp.net"))
+        );
+        let direct = "100000001@lid";
+        assert_ne!(
+            key(&info(direct, "100000001:75@lid")),
+            key(&info(direct, "100000001@lid"))
+        );
+    }
+    #[test]
     fn admission_bounds_count_bytes_and_one_oversized_frame() {
         let retention = InboundRetention::default();
         let mut leases: Vec<_> = (0..MAX_STANZAS)
