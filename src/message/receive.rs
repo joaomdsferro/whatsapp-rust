@@ -562,7 +562,7 @@ impl Client {
             // Teardown bumped the generation while this stanza waited for the
             // permit; its cache settle must be the LAST Signal-cache activity
             // of the connection. Decrypting now would advance ratchets with
-            // no committable entry — bail unacked, the server redelivers.
+            // no committable entry — bail without a receipt.
             log::debug!(
                 "Connection torn down while awaiting the processing permit; leaving message {} for redelivery",
                 info.id
@@ -572,8 +572,7 @@ impl Client {
             // any node it set aside: staying silent would leave a stanza whose
             // malformed `<enc>` was reported and whose decryptable siblings
             // were not, which is the one shape this event promises not to
-            // produce. The stanza is unacked and will come back, and the event
-            // repeats with it.
+            // produce. If another delivery arrives, the event repeats with it.
             for payload in session_payloads
                 .iter()
                 .chain(&group_payloads)

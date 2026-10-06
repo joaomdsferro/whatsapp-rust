@@ -96,7 +96,7 @@ pub(super) fn extend_pending_record(
 
 impl Client {
     /// The registered inbound durability hook, if any. `None` (default) keeps
-    /// the at-most-once ack path with zero overhead.
+    /// the existing at-most-once acknowledgement path.
     pub(crate) fn inbound_durability_hook(&self) -> Option<Arc<dyn InboundDurabilityHook>> {
         self.inbound_durability_hook.get().cloned()
     }
@@ -106,8 +106,8 @@ impl Client {
     /// acking. The replay routes through the commit batcher: during a drain it
     /// joins the accumulating batch, so its hook commit, ack and event keep
     /// arrival order with the fresh stanzas around it; live it commits
-    /// immediately as a batch of one. Either way the batch commit rewrites and
-    /// then clears its pending row, and consumers observe the message there.
+    /// immediately with all stored parts. A successful batch commit clears its
+    /// pending row, and consumers observe the message there.
     /// Usually its original batch never dispatched (the hook failed then); if
     /// it did (post-commit row cleanup failed AND the ack was lost), event
     /// consumers see it twice — the documented at-least-once shape of
