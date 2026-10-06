@@ -84,12 +84,15 @@ pub(crate) fn future_record_fields(
 /// Estimate decoder-grown unknown storage, including recursively owned payloads.
 /// buffa exposes live entries but not Vec capacity; round slots up to the
 /// decoder's geometric allocation bound. Payload Vec capacities are exact.
-pub(crate) fn unknown_fields_retained(fields: &buffa::UnknownFields) -> usize {
+pub(crate) fn unknown_fields_retained(storage: &impl UnknownFieldsMemory) -> usize {
+    let header = storage.heap_header_bytes();
+    let fields = storage.fields();
     if fields.is_empty() {
-        return 0;
+        return header;
     }
     let slots = fields.len().next_power_of_two().max(4);
-    slots * size_of::<buffa::UnknownField>()
+    header
+        + slots * size_of::<buffa::UnknownField>()
         + fields
             .iter()
             .map(|field| match &field.data {
@@ -98,4 +101,49 @@ pub(crate) fn unknown_fields_retained(fields: &buffa::UnknownFields) -> usize {
                 _ => 0,
             })
             .sum::<usize>()
+}
+
+pub(crate) trait UnknownFieldsMemory {
+    fn fields(&self) -> &buffa::UnknownFields;
+    fn heap_header_bytes(&self) -> usize;
+}
+
+impl UnknownFieldsMemory for buffa::UnknownFields {
+    fn fields(&self) -> &buffa::UnknownFields {
+        self
+    }
+    fn heap_header_bytes(&self) -> usize {
+        0
+    }
+}
+
+impl UnknownFieldsMemory for waproto::whatsapp::__unknown_storage::Storage {
+    fn fields(&self) -> &buffa::UnknownFields {
+        self
+    }
+    fn heap_header_bytes(&self) -> usize {
+        self.heap_header_bytes()
+    }
+}
+
+#[cfg(test)]
+mod compact_storage_tests {
+    use super::unknown_fields_retained;
+    use waproto::whatsapp::__unknown_storage::Storage;
+
+    #[test]
+    fn retained_memory_includes_the_allocated_collection_header() {
+        let mut raw = buffa::UnknownFields::new();
+        raw.push(buffa::UnknownField {
+            number: 200,
+            data: buffa::UnknownFieldData::Varint(7),
+        });
+        let header = size_of::<buffa::UnknownFields>();
+        let expected = header + unknown_fields_retained(&raw);
+        let mut storage = Storage::from(raw);
+        assert_eq!(unknown_fields_retained(&storage), expected);
+        storage.clear();
+        assert_eq!(unknown_fields_retained(&storage), header);
+        assert_eq!(unknown_fields_retained(&Storage::default()), 0);
+    }
 }

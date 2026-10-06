@@ -101,6 +101,15 @@ impl IntoIterator for Storage {
     }
 }
 impl Storage {
+    /// Collection header owned outside the message's inline pointer slot.
+    pub fn heap_header_bytes(&self) -> usize {
+        if self.0.is_some() {
+            ::core::mem::size_of::<::buffa::UnknownFields>()
+        } else {
+            0
+        }
+    }
+
     #[cold]
     #[inline(never)]
     pub(super) fn merge_unknown(
