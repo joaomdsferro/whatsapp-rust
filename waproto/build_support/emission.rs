@@ -127,6 +127,50 @@ pub fn finish(out: &Path, package: &str) -> io::Result<BTreeSet<String>> {
                 .push(syn::parse_quote!(#[doc(hidden)] pub mod __unknown_storage { #(#body)* }));
         }
 
+        if serde {
+            let mut clones = Vec::new();
+            for item in &mut file.items {
+                let syn::Item::Struct(message) = item else {
+                    continue;
+                };
+                let name = message.ident.to_string();
+                if ![
+                    "Message",
+                    "ContextInfo",
+                    "BotMetadata",
+                    "MessageContextInfo",
+                ]
+                .contains(&name.as_str())
+                {
+                    continue;
+                }
+                for attribute in &mut message.attrs {
+                    if attribute.path().is_ident("derive") {
+                        let traits = attribute.parse_args_with(syn::punctuated::Punctuated::<syn::Path, syn::Token![,]>::parse_terminated).expect("derive list");
+                        let traits: Vec<_> = traits
+                            .into_iter()
+                            .filter(|p| !p.is_ident("Clone"))
+                            .collect();
+                        *attribute = syn::parse_quote!(#[derive(#(#traits),*)]);
+                    }
+                }
+                let name = &message.ident;
+                let fields: Vec<_> = message
+                    .fields
+                    .iter()
+                    .map(|field| field.ident.as_ref().expect("named protobuf field"))
+                    .collect();
+                clones.push(syn::parse_quote! {
+                    impl ::core::clone::Clone for #name {
+                        #[inline(never)]
+                        fn clone(&self) -> Self {
+                            Self { #(#fields: ::core::clone::Clone::clone(&self.#fields)),* }
+                        }
+                    }
+                });
+            }
+            file.items.extend(clones);
+        }
         let implementation = match suffix {
             ".__oneof" => "::__buffa::oneof",
             ".__view" => "::__buffa::view",
