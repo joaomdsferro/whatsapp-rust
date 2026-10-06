@@ -15,7 +15,7 @@ pub fn controls(root: &Path, lane: Lane, toolchain: &str) -> Result<()> {
     );
     let stage = tempfile::Builder::new()
         .prefix("whatsapp-compatibility-control-")
-        .tempdir()?;
+        .tempdir_in(root.parent().context("checkout parent")?)?;
     let archive = capture(
         Command::new("git")
             .args(["archive", "--format=tar", "HEAD"])
@@ -40,6 +40,8 @@ pub fn controls(root: &Path, lane: Lane, toolchain: &str) -> Result<()> {
             .env_remove("CARGO_ENCODED_RUSTFLAGS")
             .env("CARGO_TARGET_DIR", stage.path().join("target"))
             .env("CARGO_BUILD_JOBS", "1")
+            .env("CARGO_INCREMENTAL", "0")
+            .env("CARGO_PROFILE_DEV_DEBUG", "0")
             .env("RUSTFLAGS", "");
         if lane == Lane::Wasm {
             command

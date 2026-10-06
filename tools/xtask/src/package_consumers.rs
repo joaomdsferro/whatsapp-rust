@@ -190,7 +190,7 @@ pub fn run(root: &Path, lane: Lane, toolchain: &str) -> Result<u8> {
     let order = publication_order(&meta, &packages)?;
     let stage = tempfile::Builder::new()
         .prefix("whatsapp-package-consumers-")
-        .tempdir()?;
+        .tempdir_in(root.parent().context("checkout parent")?)?;
     let stage = stage.path().canonicalize()?;
     ensure!(
         !stage.starts_with(root),
@@ -201,7 +201,7 @@ pub fn run(root: &Path, lane: Lane, toolchain: &str) -> Result<u8> {
 }
 
 pub fn frozen(root: &Path, baseline: &str, lane: Lane, toolchain: &str) -> Result<u8> {
-    let source = tempfile::tempdir()?;
+    let source = tempfile::tempdir_in(root.parent().context("checkout parent")?)?;
     let archive = capture(
         Command::new("git")
             .args([
@@ -219,7 +219,7 @@ pub fn frozen(root: &Path, baseline: &str, lane: Lane, toolchain: &str) -> Resul
     let order = publication_order(&meta, &packages)?;
     let stage = tempfile::Builder::new()
         .prefix("whatsapp-frozen-consumers-")
-        .tempdir()?;
+        .tempdir_in(root.parent().context("checkout parent")?)?;
     run_staged(
         root,
         source.path(),

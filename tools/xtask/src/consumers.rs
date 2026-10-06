@@ -380,6 +380,11 @@ pub fn run(root: &Path, task: Task) -> Result<u8> {
                 .args(&args)
                 .current_dir(root)
                 .env("CARGO_BUILD_JOBS", "1")
+                // Many independent profiles compile the generated protocol crate.
+                // Debug symbols and incremental state dwarf these contract tests.
+                .env("CARGO_INCREMENTAL", "0")
+                .env("CARGO_PROFILE_DEV_DEBUG", "0")
+                .env("CARGO_PROFILE_TEST_DEBUG", "0")
                 .env("CARGO_TARGET_DIR", root.join("target/consumers"))
                 // Do not leak host nightly flags into the MSRV or WASM hosts.
                 .env_remove("CARGO_ENCODED_RUSTFLAGS")
