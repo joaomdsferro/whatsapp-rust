@@ -350,13 +350,14 @@ pub fn run(root: &Path, release: bool, lane: Lane, toolchain: &str) -> Result<u8
                 )?;
             }
         }
-        return crate::package_consumers::frozen(root, baseline, lane, toolchain);
+    } else {
+        println!(
+            "API preparation: checking candidate profiles and current consumers; no RC compatibility claim or release authorization"
+        );
     }
-    println!(
-        "API preparation: checking candidate profiles and current consumers; no RC compatibility claim or release authorization"
-    );
     // Do not gate intentional pre-1.0 changes against the published 0.7.0 API.
-    // These checks remain required; tool/build failures are never swallowed.
+    // Every declared profile must still build after freezing: an old consumer
+    // does not necessarily enable every feature that promises MSRV/WASM support.
     for profile in &policy.profiles {
         if lane == Lane::Wasm && !profile.wasm {
             continue;
@@ -384,6 +385,9 @@ pub fn run(root: &Path, release: bool, lane: Lane, toolchain: &str) -> Result<u8
             command.args(["--features", &features.join(",")]);
         }
         execute(&mut command)?;
+    }
+    if let Some(baseline) = &policy.baseline {
+        return crate::package_consumers::frozen(root, baseline, lane, toolchain);
     }
     consumers::run(
         root,
