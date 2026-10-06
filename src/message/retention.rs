@@ -10,10 +10,17 @@ const MAX_STANZAS: usize = 400;
 const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 const RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
 type Key = (String, String, String);
-fn key(info: &MessageInfo) -> Key {
+pub(super) fn key(info: &MessageInfo) -> Key {
     (
         info.source.chat.to_string(),
-        info.source.sender.to_string(),
+        if info.source.chat.is_group()
+            || info.source.chat.is_broadcast_list()
+            || info.source.chat.is_status_broadcast()
+        {
+            info.source.sender.to_non_ad().to_string()
+        } else {
+            info.source.sender.to_string()
+        },
         info.id.to_string(),
     )
 }
@@ -50,11 +57,44 @@ enum State {
 struct Stanza {
     id: u64,
     items: Vec<InboundMessage>,
+    // Parts produced by this delivery, distinct from retained/replayed parts.
+    fresh: Vec<InboundMessage>,
     state: State,
     receipt: bool,
     ticket: Option<InboundCommitTicket>,
     admissions: Vec<Arc<InboundAdmission>>,
     commit_waiters: Vec<futures::channel::oneshot::Sender<()>>,
+}
+impl Stanza {
+    fn reconcile(&mut self) {
+        if self.items.is_empty() {
+            self.items = std::mem::take(&mut self.fresh);
+            return;
+        }
+        // Match occurrences, not a set of contents: [A,A] remains two parts,
+        // while another delivery of [A,A] contributes no additional copies.
+        // Reuse the dispatch fingerprint's established SKDM equivalence.
+        let mut prior = HashMap::<DispatchFingerprint, usize>::new();
+        let mut scratch = Vec::new();
+        for item in &self.items {
+            *prior
+                .entry(MessageDispatch::fingerprint_into(
+                    &item.message,
+                    &mut scratch,
+                ))
+                .or_default() += 1;
+        }
+        for item in self.fresh.drain(..) {
+            let fingerprint = MessageDispatch::fingerprint_into(&item.message, &mut scratch);
+            if let Some(count) = prior.get_mut(&fingerprint)
+                && *count != 0
+            {
+                *count -= 1;
+            } else {
+                self.items.push(item);
+            }
+        }
+    }
 }
 #[derive(Default)]
 pub(crate) struct InboundRetention {
@@ -142,6 +182,7 @@ impl InboundRetention {
             Stanza {
                 id,
                 items: Vec::new(),
+                fresh: Vec::new(),
                 state: State::Collecting,
                 receipt: false,
                 ticket: None,
@@ -165,7 +206,7 @@ impl InboundRetention {
         if stanza.state != State::Collecting {
             return None;
         }
-        stanza.items.extend_from_slice(items);
+        stanza.fresh.extend_from_slice(items);
         let ticket = track.then(|| {
             stanza
                 .ticket
@@ -190,15 +231,27 @@ impl InboundRetention {
     pub(crate) fn has_plaintext(&self, info: &MessageInfo) -> bool {
         lock(&self.stanzas)
             .get(&key(info))
-            .is_some_and(|s| !s.items.is_empty())
+            .is_some_and(|s| !s.items.is_empty() || !s.fresh.is_empty())
     }
-    pub(crate) fn discard_empty(&self, info: &MessageInfo) {
+    pub(crate) fn seed_replay(&self, items: Vec<InboundMessage>) {
+        let Some(first) = items.first() else { return };
         let mut stanzas = lock(&self.stanzas);
-        if stanzas
-            .get(&key(info))
-            .is_some_and(|s| s.state == State::Collecting && s.items.is_empty())
+        if let Some(stanza) = stanzas.get_mut(&key(&first.info)) {
+            debug_assert!(stanza.items.is_empty());
+            stanza.items = items;
+        }
+    }
+    pub(crate) fn abandon_collection(&self, info: &MessageInfo) {
+        let mut stanzas = lock(&self.stanzas);
+        if let Some(stanza) = stanzas.get_mut(&key(info))
+            && stanza.state == State::Collecting
         {
-            stanzas.remove(&key(info));
+            stanza.reconcile();
+            if stanza.items.is_empty() {
+                stanzas.remove(&key(info));
+            } else {
+                stanza.state = State::Retry;
+            }
         }
     }
     pub(crate) fn seal(&self, info: &MessageInfo, draining: bool) -> (Arc<[InboundMessage]>, bool) {
@@ -206,6 +259,7 @@ impl InboundRetention {
         let Some(stanza) = stanzas.get_mut(&key(info)) else {
             return (Arc::from([]), false);
         };
+        stanza.reconcile();
         if stanza.items.is_empty() {
             let receipt = stanza.receipt;
             stanzas.remove(&key(info));
@@ -335,6 +389,28 @@ pub(crate) struct RetentionCommit {
     _admissions: Vec<Arc<InboundAdmission>>,
 }
 impl RetentionCommit {
+    pub(crate) fn owns(&self, info: &MessageInfo) -> bool {
+        self.keys.contains(&key(info))
+    }
+    pub(crate) fn canonical_items(&self, items: Arc<[InboundMessage]>) -> Arc<[InboundMessage]> {
+        if self.keys.is_empty() {
+            return items;
+        }
+        let stanzas = lock(&self.retention.stanzas);
+        let mut emitted = std::collections::HashSet::new();
+        let mut canonical = Vec::new();
+        for item in items.iter() {
+            let key = key(&item.info);
+            if self.keys.contains(&key) {
+                if emitted.insert(key.clone()) {
+                    canonical.extend_from_slice(&stanzas[&key].items);
+                }
+            } else {
+                canonical.push(item.clone());
+            }
+        }
+        canonical.into()
+    }
     pub(crate) fn durable(&self) {
         if self.keys.is_empty() {
             return;
