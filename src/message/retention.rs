@@ -233,25 +233,23 @@ impl InboundRetention {
             .get(&key(info))
             .is_some_and(|s| !s.items.is_empty() || !s.fresh.is_empty())
     }
+    pub(crate) fn collection_guard(
+        self: &Arc<Self>,
+        info: &Arc<MessageInfo>,
+    ) -> RetentionCollection {
+        let id = lock(&self.stanzas)[&key(info)].id;
+        RetentionCollection {
+            retention: Arc::clone(self),
+            info: Arc::clone(info),
+            id,
+        }
+    }
     pub(crate) fn seed_replay(&self, items: Vec<InboundMessage>) {
         let Some(first) = items.first() else { return };
         let mut stanzas = lock(&self.stanzas);
         if let Some(stanza) = stanzas.get_mut(&key(&first.info)) {
             debug_assert!(stanza.items.is_empty());
             stanza.items = items;
-        }
-    }
-    pub(crate) fn abandon_collection(&self, info: &MessageInfo) {
-        let mut stanzas = lock(&self.stanzas);
-        if let Some(stanza) = stanzas.get_mut(&key(info))
-            && stanza.state == State::Collecting
-        {
-            stanza.reconcile();
-            if stanza.items.is_empty() {
-                stanzas.remove(&key(info));
-            } else {
-                stanza.state = State::Retry;
-            }
         }
     }
     pub(crate) fn seal(&self, info: &MessageInfo, draining: bool) -> (Arc<[InboundMessage]>, bool) {
@@ -344,6 +342,29 @@ impl InboundRetention {
                 Some(RetryAttempt::new(self, key.clone(), stanza))
             })
             .collect()
+    }
+}
+
+pub(crate) struct RetentionCollection {
+    retention: Arc<InboundRetention>,
+    info: Arc<MessageInfo>,
+    id: u64,
+}
+impl Drop for RetentionCollection {
+    fn drop(&mut self) {
+        let mut stanzas = lock(&self.retention.stanzas);
+        let key = key(&self.info);
+        if let Some(stanza) = stanzas.get_mut(&key)
+            && stanza.id == self.id
+            && stanza.state == State::Collecting
+        {
+            stanza.reconcile();
+            if stanza.items.is_empty() {
+                stanzas.remove(&key);
+            } else {
+                stanza.state = State::Retry;
+            }
+        }
     }
 }
 
@@ -672,6 +693,49 @@ mod tests {
             drop(commit);
             assert_eq!(retention.stats(), (0, 0));
         }
+    }
+    #[tokio::test]
+    async fn abandoned_collection_preserves_old_and_new_parts_and_multiplicity() {
+        let retention = Arc::new(InboundRetention::default());
+        let first = item("partial", "A");
+        assert!(retention.begin(&first.info, retention.admit(100)).await);
+        let guard = retention.collection_guard(&first.info);
+        retention
+            .stage(std::slice::from_ref(&first), false)
+            .unwrap();
+        drop(guard);
+        let old_attempt = retention.retry_one(&first.info).unwrap();
+        assert!(!retention.begin(&first.info, retention.admit(200)).await);
+        let guard = retention.collection_guard(&first.info);
+        retention
+            .stage(&[first.clone(), first.clone(), item("partial", "B")], false)
+            .unwrap();
+        drop(guard);
+        drop(old_attempt);
+        let retry = retention.retry_one(&first.info).unwrap();
+        assert_eq!(
+            retry
+                .items
+                .iter()
+                .map(|item| item.message.conversation.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["A", "A", "B"]
+        );
+        assert_eq!(retention.stats(), (2, 300));
+        let mut commit = retention.commit(&retry.items).unwrap();
+        commit.complete();
+        drop(commit);
+        drop(retry);
+        assert_eq!(retention.stats(), (0, 0));
+    }
+    #[tokio::test]
+    async fn abandoned_empty_collection_releases_its_admission() {
+        let retention = Arc::new(InboundRetention::default());
+        let first = item("empty", "A");
+        retention.begin(&first.info, retention.admit(100)).await;
+        drop(retention.collection_guard(&first.info));
+        assert_eq!(retention.stats(), (0, 0));
+        assert!(retention.retry_items().is_empty());
     }
     #[tokio::test]
     async fn restoring_an_old_snapshot_does_not_seal_a_new_producer() {

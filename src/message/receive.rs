@@ -588,16 +588,15 @@ impl Client {
             return;
         }
 
+        let _collection;
         if self.inbound_durability_hook().is_some() {
             let fresh = self
                 .inbound_commit_batch
                 .retention
                 .begin(&info, admission)
                 .await;
+            _collection = Some(self.inbound_commit_batch.retention.collection_guard(&info));
             if self.connection_generation.load(Ordering::Acquire) != lane_generation {
-                self.inbound_commit_batch
-                    .retention
-                    .abandon_collection(&info);
                 for payload in session_payloads
                     .iter()
                     .chain(&group_payloads)
@@ -640,9 +639,6 @@ impl Client {
                             log::error!(
                                 "Pending inbound record cannot be decoded; preserving it without decrypting another delivery: {error:?}"
                             );
-                            self.inbound_commit_batch
-                                .retention
-                                .abandon_collection(&info);
                             return;
                         }
                     },
@@ -651,15 +647,14 @@ impl Client {
                         log::warn!(
                             "Pending inbound read failed before decrypt; withholding receipt: {error:?}"
                         );
-                        self.inbound_commit_batch
-                            .retention
-                            .abandon_collection(&info);
                         return;
                     }
                 }
             }
         }
 
+        // The guard restores partial plaintext on cancellation or an early
+        // return; sealing transfers recovery ownership to the commit path.
         log::debug!(
             "Starting PASS 1: Processing {} session establishment messages (pkmsg/msg)",
             session_payloads.len()
