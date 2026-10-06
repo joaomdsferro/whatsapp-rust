@@ -4300,7 +4300,7 @@ impl ProtocolStore for SqliteStore {
             let chat = chat.clone();
             let id = id.clone();
             Box::new(move |conn: &mut SqliteConnection| {
-                Ok(pending_inbound_messages::table
+                pending_inbound_messages::table
                     .select((
                         pending_inbound_messages::sender,
                         pending_inbound_messages::message,
@@ -4308,7 +4308,7 @@ impl ProtocolStore for SqliteStore {
                     .filter(pending_inbound_messages::chat.eq(&chat))
                     .filter(pending_inbound_messages::id.eq(&id))
                     .filter(pending_inbound_messages::device_id.eq(device_id))
-                    .load(conn)?)
+                    .load(conn)
             })
         })
         .await
@@ -4860,8 +4860,10 @@ mod tests {
 
     #[tokio::test]
     async fn pending_message_lookup_preserves_opaque_rows_and_device_scope() {
-        let store = create_test_store().await;
-        let (_, other) = store.create_sibling_device_impl().await.unwrap();
+        let database = create_test_store().await;
+        let (first_id, store) = database.create_sibling_device_impl().await.unwrap();
+        let (second_id, other) = store.create_sibling_device_impl().await.unwrap();
+        assert_ne!(first_id, second_id);
         for sender in ["100:75@lid", "100@lid", "100@s.whatsapp.net"] {
             store
                 .store_pending_inbound("group", sender, "id", &[0, 255, 7])
