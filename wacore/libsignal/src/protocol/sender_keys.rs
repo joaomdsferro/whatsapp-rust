@@ -1136,7 +1136,7 @@ impl SenderKeyRecord {
         {
             let mut proto = SenderKeyRecordStructure::default();
             proto.sender_key_states = states;
-            proto.__buffa_unknown_fields = self.future.clone();
+            proto.__buffa_unknown_fields = self.future.clone().into();
             proto
         }
     }

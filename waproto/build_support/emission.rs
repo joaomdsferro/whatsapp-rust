@@ -42,6 +42,64 @@ impl VisitMut for Extensible {
     }
 }
 
+struct ColdStorage {
+    depth: usize,
+}
+impl VisitMut for ColdStorage {
+    fn visit_item_mod_mut(&mut self, item: &mut syn::ItemMod) {
+        self.depth += 1;
+        visit_mut::visit_item_mod_mut(self, item);
+        self.depth -= 1;
+    }
+    fn visit_field_mut(&mut self, field: &mut syn::Field) {
+        if field
+            .ident
+            .as_ref()
+            .is_some_and(|name| name == "__buffa_unknown_fields")
+        {
+            let prefix = "super::".repeat(self.depth);
+            field.ty = syn::parse_str(&format!("{prefix}__unknown_storage::Storage"))
+                .expect("internal storage path");
+        }
+        visit_mut::visit_field_mut(self, field);
+    }
+    fn visit_expr_mut(&mut self, expr: &mut syn::Expr) {
+        visit_mut::visit_expr_mut(self, expr);
+        let syn::Expr::MethodCall(call) = expr else {
+            return;
+        };
+        if call.method != "push" || call.args.len() != 1 {
+            return;
+        }
+        let syn::Expr::Field(field) = &*call.receiver else {
+            return;
+        };
+        if !matches!(&field.member, syn::Member::Named(name) if name == "__buffa_unknown_fields") {
+            return;
+        }
+        let syn::Expr::Try(attempt) = &call.args[0] else {
+            return;
+        };
+        let syn::Expr::Call(decode) = &*attempt.expr else {
+            return;
+        };
+        let syn::Expr::Path(path) = &*decode.func else {
+            return;
+        };
+        if !path
+            .path
+            .segments
+            .last()
+            .is_some_and(|p| p.ident == "decode_unknown_field")
+        {
+            return;
+        }
+        let receiver = &call.receiver;
+        let args = &decode.args;
+        *expr = syn::parse_quote!(#receiver.merge_unknown(#args)?);
+    }
+}
+
 fn protect(attrs: &mut Vec<syn::Attribute>) {
     if !attrs.iter().any(|a| a.path().is_ident("non_exhaustive")) {
         attrs.push(syn::parse_quote!(#[non_exhaustive]));
@@ -61,6 +119,14 @@ pub fn finish(out: &Path, package: &str) -> io::Result<BTreeSet<String>> {
         let source = std::fs::read_to_string(&path)?;
         let mut file = syn::parse_file(&source).map_err(io::Error::other)?;
         Extensible { serde }.visit_file_mut(&mut file);
+        if serde {
+            ColdStorage { depth: 0 }.visit_file_mut(&mut file);
+            let body = syn::parse_file(include_str!("unknown_storage.rs")).expect("storage syntax");
+            let body = body.items;
+            file.items
+                .push(syn::parse_quote!(#[doc(hidden)] pub mod __unknown_storage { #(#body)* }));
+        }
+
         let implementation = match suffix {
             ".__oneof" => "::__buffa::oneof",
             ".__view" => "::__buffa::view",
