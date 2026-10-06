@@ -221,7 +221,11 @@ impl InboundRetention {
     pub(crate) fn batched(&self, items: &[InboundMessage]) {
         let mut stanzas = lock(&self.stanzas);
         for item in items {
-            if let Some(stanza) = stanzas.get_mut(&key(&item.info)) {
+            if let Some(stanza) = stanzas.get_mut(&key(&item.info))
+                && stanza.state != State::Collecting
+            {
+                // An older snapshot may be restored while a newer producer
+                // extends this identity after a connection reset.
                 stanza.state = State::Batched;
             }
         }
@@ -592,5 +596,25 @@ mod tests {
             drop(commit);
             assert_eq!(retention.stats(), (0, 0));
         }
+    }
+    #[tokio::test]
+    async fn restoring_an_old_snapshot_does_not_seal_a_new_producer() {
+        let retention = Arc::new(InboundRetention::default());
+        let first = item("same-identity", "first");
+        assert!(retention.begin(&first.info, retention.admit(100)).await);
+        retention
+            .stage(std::slice::from_ref(&first), false)
+            .unwrap();
+        let (old_items, _) = retention.seal(&first.info, true);
+        assert!(!retention.begin(&first.info, retention.admit(100)).await);
+        assert!(retention.commit(&old_items).is_none());
+        retention.batched(&old_items);
+        retention
+            .stage(&[item("same-identity", "second")], false)
+            .unwrap();
+        let (items, _) = retention.seal(&first.info, false);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].message.conversation.as_deref(), Some("first"));
+        assert_eq!(items[1].message.conversation.as_deref(), Some("second"));
     }
 }
