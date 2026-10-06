@@ -79,6 +79,10 @@ fn shared_message_clones_keep_unknown_wire_after_original_is_dropped() {
     check::<waproto::whatsapp::ContextInfo>();
     check::<waproto::whatsapp::BotMetadata>();
     check::<waproto::whatsapp::MessageContextInfo>();
+    check::<waproto::whatsapp::message::ImageMessage>();
+    check::<waproto::whatsapp::message::VideoMessage>();
+    check::<waproto::whatsapp::message::InteractiveMessage>();
+    check::<waproto::whatsapp::message::HighlyStructuredMessage>();
 
     let mut message = waproto::whatsapp::Message::default();
     message.conversation = Some("synthetic clone fixture".into());
