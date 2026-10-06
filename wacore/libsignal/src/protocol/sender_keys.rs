@@ -2170,7 +2170,7 @@ mod tests {
         let mut record = record_with_state(42, 0x55);
         record
             .sender_key_state_mut()
-            .unwrap()
+            .expect("valid synthetic sender-key fixture")
             .add_skipped_message_key(7, [0x66; 32]);
         let mut pb = record.as_protobuf();
         let future = buffa::UnknownField {
@@ -2183,32 +2183,58 @@ mod tests {
         state
             .sender_chain_key
             .as_option_mut()
-            .unwrap()
+            .expect("valid synthetic sender-key fixture")
             .__buffa_unknown_fields
             .push(future.clone());
         state
             .sender_signing_key
             .as_option_mut()
-            .unwrap()
+            .expect("valid synthetic sender-key fixture")
             .__buffa_unknown_fields
             .push(future.clone());
         state.sender_message_keys[0]
             .__buffa_unknown_fields
             .push(future.clone());
         let wire = pb.encode_to_vec();
-        let mut loaded = SenderKeyRecord::deserialize(&wire).unwrap();
-        assert_eq!(loaded.serialize().unwrap(), wire);
+        let mut loaded =
+            SenderKeyRecord::deserialize(&wire).expect("valid synthetic sender-key fixture");
+        assert_eq!(
+            loaded
+                .serialize()
+                .expect("valid synthetic sender-key fixture"),
+            wire
+        );
         assert!(loaded.estimated_size() >= 5 * 8192);
         assert!(!format!("{loaded:?}").contains("LengthDelimited"));
         loaded.reserve_iterations(0);
-        let stored = loaded.serialize_for_store(&[0x33; 16]).unwrap();
-        loaded = SenderKeyRecord::deserialize_for_store(&stored, &[0x33; 16]).unwrap();
-        assert_eq!(loaded.serialize_for_store(&[0x33; 16]).unwrap(), stored);
+        let stored = loaded
+            .serialize_for_store(&[0x33; 16])
+            .expect("valid synthetic sender-key fixture");
+        loaded = SenderKeyRecord::deserialize_for_store(&stored, &[0x33; 16])
+            .expect("valid synthetic sender-key fixture");
+        assert_eq!(
+            loaded
+                .serialize_for_store(&[0x33; 16])
+                .expect("valid synthetic sender-key fixture"),
+            stored
+        );
 
-        let state = loaded.sender_key_state_mut().unwrap();
-        state.set_sender_chain_key(state.sender_chain_key().unwrap().next().unwrap());
-        let restored =
-            waproto::codec::sender_key_record_decode(&loaded.serialize().unwrap()).unwrap();
+        let state = loaded
+            .sender_key_state_mut()
+            .expect("valid synthetic sender-key fixture");
+        state.set_sender_chain_key(
+            state
+                .sender_chain_key()
+                .expect("valid synthetic sender-key fixture")
+                .next()
+                .expect("valid synthetic sender-key fixture"),
+        );
+        let restored = waproto::codec::sender_key_record_decode(
+            &loaded
+                .serialize()
+                .expect("valid synthetic sender-key fixture"),
+        )
+        .expect("valid synthetic sender-key fixture");
         assert_eq!(
             future_record_fields(restored.__buffa_unknown_fields),
             pb.__buffa_unknown_fields
@@ -2230,22 +2256,28 @@ mod tests {
         );
         loaded
             .sender_key_state_mut()
-            .unwrap()
+            .expect("valid synthetic sender-key fixture")
             .remove_sender_message_key(7)
-            .unwrap();
-        let state = loaded.sender_key_state().unwrap();
+            .expect("valid synthetic sender-key fixture");
+        let state = loaded
+            .sender_key_state()
+            .expect("valid synthetic sender-key fixture");
         assert!(
             state
                 .future
                 .as_ref()
-                .unwrap()
+                .expect("valid synthetic sender-key fixture")
                 .sender_message_keys
                 .is_empty()
         );
         assert!(
-            waproto::codec::sender_key_record_decode(&loaded.serialize().unwrap())
-                .unwrap()
-                .sender_key_states[0]
+            waproto::codec::sender_key_record_decode(
+                &loaded
+                    .serialize()
+                    .expect("valid synthetic sender-key fixture")
+            )
+            .expect("valid synthetic sender-key fixture")
+            .sender_key_states[0]
                 .sender_message_keys
                 .is_empty()
         );
