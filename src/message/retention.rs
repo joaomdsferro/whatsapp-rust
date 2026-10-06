@@ -443,8 +443,10 @@ mod tests {
     fn item(id: &str, body: &str) -> InboundMessage {
         let mut message = wa::Message::default();
         message.conversation = Some(body.to_owned());
-        let mut info = MessageInfo::default();
-        info.id = id.into();
+        let info = MessageInfo {
+            id: id.into(),
+            ..Default::default()
+        };
         InboundMessage::builder()
             .message(Arc::new(message))
             .info(Arc::new(info))

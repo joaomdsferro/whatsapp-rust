@@ -494,7 +494,7 @@ impl Client {
         })
     }
 
-    #[cfg(any(test, feature = "bench-harness"))]
+    #[cfg(test)]
     pub(crate) async fn process_classified_message(
         self: Arc<Self>,
         msg: ClassifiedMessage,

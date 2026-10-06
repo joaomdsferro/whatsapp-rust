@@ -1106,11 +1106,10 @@ impl Client {
                 let missing: Vec<_> = rows
                     .into_iter()
                     .zip(&updates)
-                    .filter_map(|(row, (write, bytes))| {
-                        write.then(|| PendingInboundRow {
-                            message: bytes.as_deref().unwrap_or(row.message),
-                            ..row
-                        })
+                    .filter(|(_, (write, _))| *write)
+                    .map(|(row, (_, bytes))| PendingInboundRow {
+                        message: bytes.as_deref().unwrap_or(row.message),
+                        ..row
                     })
                     .collect();
                 if !missing.is_empty()
