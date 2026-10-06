@@ -17,6 +17,7 @@ core = []
 contracts = []
 sdk = ["dep:whatsapp-rust"]
 native = ["sdk", "whatsapp-rust/tokio-runtime", "dep:tokio", "dep:anyhow", "dep:async-channel", "dep:async-trait"]
+event-fixtures = ["native", "whatsapp-rust/bench-harness"]
 plugins = ["sdk", "whatsapp-rust/plugins"]
 voip-control = ["sdk", "whatsapp-rust/voip-control"]
 voip-runtime = ["voip-control", "whatsapp-rust/voip-runtime"]
@@ -129,3 +130,8 @@ required-features = ["sqlite"]
 name = "download_probe"
 path = "src/download/size_probe.rs"
 required-features = ["core"]
+
+[[test]]
+name = "event_delivery"
+path = "../event_delivery_public.rs"
+required-features = ["event-fixtures"]
