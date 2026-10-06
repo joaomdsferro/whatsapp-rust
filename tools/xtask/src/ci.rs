@@ -8,6 +8,13 @@ use xtask_support::{capture, write};
 
 #[derive(Subcommand)]
 pub enum Task {
+    /// Qualify existing consumers against packaged crates outside this checkout.
+    PackageConsumers {
+        #[arg(long, value_enum)]
+        lane: super::consumers::Lane,
+        #[arg(long)]
+        toolchain: String,
+    },
     /// Registered standalone API hosts and drift detection.
     Consumers {
         #[command(subcommand)]
@@ -182,6 +189,9 @@ fn timed_report(
 pub fn run(root: &Path, task: Task) -> Result<u8> {
     match task {
         Task::Consumers { task } => return super::consumers::run(root, task),
+        Task::PackageConsumers { lane, toolchain } => {
+            return super::package_consumers::run(root, lane, &toolchain);
+        }
         Task::Workflow { task } => super::workflow::run_task(root, task)?,
         Task::TestWaprotoFeatures => {
             let mut status = 0;
