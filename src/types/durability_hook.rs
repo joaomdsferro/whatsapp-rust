@@ -19,7 +19,9 @@ use waproto::whatsapp as wa;
 /// running. A duplicate cannot bypass a resident copy just because its pending
 /// database row is absent. Corrupt or conflicting pending records are preserved
 /// and withhold receipts until repaired; uncommitted rows never expire
-/// automatically. Existing rows from a previous process are replayed when a
+/// automatically. Multipart records use a versioned envelope; the reader also
+/// accepts legacy single-message records, but older SDKs cannot read the new
+/// multipart format. Existing rows from a previous process are replayed when a
 /// corresponding inbound delivery reaches the replay path, not scanned at startup.
 ///
 /// Receipt suppression does not guarantee another server delivery. If the

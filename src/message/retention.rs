@@ -234,6 +234,7 @@ impl InboundRetention {
             _admissions: admissions,
         })
     }
+    #[cfg(test)]
     fn retry_one(self: &Arc<Self>, info: &MessageInfo) -> Option<RetryAttempt> {
         let mut stanzas = lock(&self.stanzas);
         let key = key(info);
@@ -359,25 +360,6 @@ impl Client {
             .admit(node.backing_bytes().len())
             .map(Some)
             .ok_or(())
-    }
-
-    pub(crate) async fn retry_retained_stanza(self: &Arc<Self>, info: &MessageInfo) {
-        let Some(attempt) = self.inbound_commit_batch.retention.retry_one(info) else {
-            return;
-        };
-        // Acquire the chat gate first: waiters for one slow chat must not
-        // consume all global slots and stall unrelated chats.
-        let _chat = self
-            .inbound_commit_batch
-            .retention
-            .chat_gate(info)
-            .lock_arc()
-            .await;
-        let _permit = self.acquire_message_processing_permit().await;
-        if attempt.is_current() {
-            self.commit_or_batch_inbound_items(Arc::clone(&attempt.items), false)
-                .await;
-        }
     }
 
     pub(crate) fn start_inbound_recovery(self: &Arc<Self>) {

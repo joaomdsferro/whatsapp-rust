@@ -2,6 +2,7 @@
 
 use super::*;
 use smallvec::SmallVec;
+use wacore::types::events::{BatchOrigin, InboundMessage};
 
 /// Parsed session envelope with explicit retry/ownership semantics.
 ///
@@ -493,11 +494,6 @@ impl Client {
         })
     }
 
-    /// Phase 2: acquire permit, decrypt payloads, flush. No node borrows.
-    #[cfg_attr(
-        feature = "tracing",
-        tracing::instrument(name = "wa.recv.process", level = "debug", skip_all)
-    )]
     #[cfg(any(test, feature = "bench-harness"))]
     pub(crate) async fn process_classified_message(
         self: Arc<Self>,
@@ -508,6 +504,11 @@ impl Client {
             .await;
     }
 
+    /// Phase 2: acquire permit, decrypt payloads, flush. No node borrows.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.recv.process", level = "debug", skip_all)
+    )]
     async fn process_admitted_message(
         self: Arc<Self>,
         msg: ClassifiedMessage,
@@ -843,7 +844,7 @@ impl Client {
                 // A reconnect can re-arm the shared drain while an older live
                 // producer finishes. Keep that producer's immediate commit
                 // inside its chat gate instead of moving it into the new drain.
-                self.commit_inbound_batch(items, wacore::types::events::BatchOrigin::Live, None)
+                self.commit_inbound_batch(items, BatchOrigin::Live, None)
                     .await;
             }
         } else if receipt {
