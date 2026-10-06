@@ -19,6 +19,14 @@ pub const WHATSAPP_WEB_WS_URL: &str = "wss://web.whatsapp.com/ws/chat";
 pub const WHATSAPP_WEB_WS_URL_FALLBACK: &str = "wss://web.whatsapp.com:5222/ws/chat";
 
 /// Default chat endpoints, primary first. The number of endpoints may grow.
+///
+/// ```
+/// use wacore::net::WHATSAPP_WEB_WS_URLS;
+/// let endpoints: &[&str] = WHATSAPP_WEB_WS_URLS;
+/// for endpoint in endpoints {
+///     assert!(endpoint.starts_with("wss://"));
+/// }
+/// ```
 pub const WHATSAPP_WEB_WS_URLS: &[&str] = &[WHATSAPP_WEB_WS_URL, WHATSAPP_WEB_WS_URL_FALLBACK];
 
 /// Appends an `ED` edge-routing query parameter to a chat URL.
