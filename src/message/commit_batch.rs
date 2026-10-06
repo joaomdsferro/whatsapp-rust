@@ -1123,18 +1123,15 @@ impl Client {
                     return false;
                 }
             }
-            // A failed flush reports not-durable so buffered receipts are held
-            // back. The guard is still armed: the rows are in place and
-            // re-storing them is idempotent (replace-into), so the restored
-            // entries make the batch retryable THIS session — the retry
-            // re-runs the full commit (rows → flush → hook → acks → event)
-            // instead of parking the messages until a reconnect replay.
+            // A failed flush holds buffered receipts back and restores the
+            // batch. A retry reuses compatible stored rows and repeats the
+            // flush, hook, receipt and event pipeline.
             if is_drain && !self.drain_signal_flush_reporting().await {
                 return false;
             }
-            // Rows durable and Signal flushed: from here on a cancelled
-            // future must not restore the entries — redelivery replays from
-            // the rows.
+            // The batch queue can release these entries once the durable
+            // point is reached. The separate retention guard still keeps
+            // plaintext for local retry if the hook fails or is cancelled.
             reinsert.mark_durable();
             retained.durable();
 

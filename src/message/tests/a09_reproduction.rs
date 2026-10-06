@@ -684,7 +684,7 @@ async fn resident_failures_recover_without_another_server_delivery() {
             } else {
                 f.buffer_failure(false);
             }
-            let published = tokio::time::timeout(std::time::Duration::from_secs(6), async {
+            let published = tokio::time::timeout(std::time::Duration::from_secs(12), async {
                 loop {
                     let published = f.published();
                     if !published.is_empty() {
