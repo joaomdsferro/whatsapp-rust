@@ -959,6 +959,43 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::disallowed_methods)]
+    fn history_text_preserves_presence_rules_across_wire_views_and_serde() {
+        use buffa::Message as _;
+        use waproto::whatsapp as wa;
+
+        let absent = wa::Message::default().with_conversation("synthetic text");
+        let mut empty_wrapper = absent.clone();
+        empty_wrapper.ephemeral_message = buffa::MessageField::some(Default::default());
+        let mut empty_restriction = absent.clone();
+        let mut context = wa::MessageContextInfo::default();
+        context.limit_sharing = buffa::MessageField::some(Default::default());
+        empty_restriction.message_context_info = buffa::MessageField::some(context);
+        // buffa's semantic equality ignores the presence of default-valued
+        // submessages; neither wire presence nor admission may do so.
+        assert_eq!(absent, empty_wrapper);
+        assert_eq!(absent, empty_restriction);
+        let absent_json = serde_json::to_value(&absent).unwrap();
+        for (message, admitted) in [
+            (absent, true),
+            (empty_wrapper, false),
+            (empty_restriction, false),
+        ] {
+            let wire = message.encode_to_vec();
+            let decoded = wa::Message::decode_from_slice(&wire).unwrap();
+            let handle = wa::MessageOwnedView::decode(wire.clone().into()).unwrap();
+            let json = serde_json::to_value(&message).unwrap();
+            assert_eq!(json == absent_json, admitted);
+            for restored in [decoded, handle.to_owned_message()] {
+                assert_eq!(restored.encode_to_vec(), wire);
+                assert_eq!(serde_json::to_value(&restored).unwrap(), json);
+                assert_eq!(is_shareable_history_text(&restored), admitted);
+            }
+            assert_eq!(is_shareable_history_text(&message), admitted);
+        }
+    }
+
+    #[test]
     fn history_text_admission_checks_borrowed_payload_and_context() {
         use waproto::whatsapp as wa;
 

@@ -13,6 +13,10 @@ fn unknown_message_fields_survive_owned_and_view_edits() {
     message.conversation = Some("new".into());
     let expected = [0x0a, 3, b'n', b'e', b'w', 0xc0, 0x3e, 7];
     assert_eq!(message.encode_to_vec(), expected);
+    let handle = wa::MessageOwnedView::decode(wire.to_vec().into()).unwrap();
+    let mut restored = handle.to_owned_message();
+    restored.conversation = Some("new".into());
+    assert_eq!(restored.encode_to_vec(), expected);
     let view = wa::MessageView::decode_view(&wire).unwrap();
     let mut message = view.to_owned_message().unwrap();
     message.conversation = Some("new".into());

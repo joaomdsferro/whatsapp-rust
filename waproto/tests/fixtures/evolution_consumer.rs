@@ -14,6 +14,9 @@ macro_rules! consumer {
             let bytes = record.encode_to_vec();
             let view = api::RecordView::decode_view(&bytes).unwrap();
             assert_eq!(view.name, Some("fixture"));
+            let handle = api::RecordOwnedView::from_owned(&record).unwrap();
+            assert_eq!(handle.view().name, Some("fixture"));
+            assert_eq!(handle.to_owned_message().encode_to_vec(), bytes);
             match view.choice.as_ref().unwrap() {
                 api::record::ChoiceView::Text(text) => {
                     assert_eq!(*text, "sample")
@@ -35,6 +38,8 @@ macro_rules! consumer {
             assert_eq!(record.encode_to_vec(), unknown);
             let view = api::RecordView::decode_view(&unknown).unwrap();
             assert_eq!(view.to_owned_message().unwrap().encode_to_vec(), unknown);
+            let handle = api::RecordOwnedView::decode(unknown.to_vec().into()).unwrap();
+            assert_eq!(handle.to_owned_message().encode_to_vec(), unknown);
         }
     };
 }
