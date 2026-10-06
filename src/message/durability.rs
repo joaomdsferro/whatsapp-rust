@@ -63,16 +63,12 @@ impl Client {
                         );
                     }
                     Err(e) => {
-                        // Corrupt row (our own serialization): it can never be
-                        // replayed, so drop it and ack to unstick the queue.
+                        // Preserve the only buffered copy for repair. A decode
+                        // failure does not mean the consumer committed it.
                         log::error!(
-                            "[msg:{}] failed to decode buffered inbound message; acking to unstick queue: {e:?}",
+                            "[msg:{}] failed to decode buffered inbound message; preserving bytes and withholding receipt: {e:?}",
                             info.id
                         );
-                        let _ = backend
-                            .delete_pending_inbound(&chat, &sender, &info.id)
-                            .await;
-                        self.ack_received_message(info);
                     }
                 },
                 // Genuine duplicate (never buffered, or already committed): ack it.

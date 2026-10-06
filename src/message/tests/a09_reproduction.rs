@@ -265,7 +265,10 @@ async fn hook_failure_recovers(drain: bool, corrupt: bool) {
     crate::test_utils::wait_for_outbound_tasks(&f.client).await;
     assert_eq!(f.receipts(), 0);
     assert_eq!(f.hook.attempts.load(Ordering::SeqCst), 1);
-    assert!(f.pending().await.is_some());
+    let original = f
+        .pending()
+        .await
+        .expect("failed hook retains original bytes");
     assert!(f.persisted_session().await);
     assert!(f.published().is_empty());
     if corrupt {
@@ -291,20 +294,37 @@ async fn hook_failure_recovers(drain: bool, corrupt: bool) {
         );
         crate::test_utils::wait_for_outbound_tasks(&f.client).await;
     }
-    assert_eq!(f.receipts(), 1);
-    assert!(f.pending().await.is_none());
     if corrupt {
         assert_eq!(
-            f.hook.attempts.load(Ordering::SeqCst),
-            1,
-            "corrupt row bypasses the consumer on redelivery"
+            f.receipts(),
+            0,
+            "corruption cannot acknowledge an uncommitted message"
         );
+        assert_eq!(
+            f.pending().await.as_deref(),
+            Some(&[0xff][..]),
+            "retain exact bytes for diagnosis or repair"
+        );
+        assert_eq!(f.hook.attempts.load(Ordering::SeqCst), 1);
         assert_eq!(f.hook.committed.load(Ordering::SeqCst), 0);
         assert!(f.published().is_empty());
-    } else {
-        assert_eq!(f.hook.committed.load(Ordering::SeqCst), 1);
-        assert_eq!(f.published(), ["synthetic retained body"]);
+        f.client
+            .persistence_manager
+            .backend()
+            .store_pending_inbound(
+                &f.info.source.chat.to_string(),
+                &f.info.source.sender.to_string(),
+                &f.info.id,
+                &original,
+            )
+            .await
+            .unwrap();
+        f.receive().await;
     }
+    assert_eq!(f.receipts(), 1);
+    assert!(f.pending().await.is_none());
+    assert_eq!(f.hook.committed.load(Ordering::SeqCst), 1);
+    assert_eq!(f.published(), ["synthetic retained body"]);
 }
 
 #[tokio::test]
@@ -316,7 +336,7 @@ async fn a09_drain_hook_failure_replays_buffer() {
     hook_failure_recovers(true, false).await;
 }
 #[tokio::test]
-async fn a09_corrupt_replay_row_is_deleted_and_acked_without_delivery() {
+async fn a09_corrupt_replay_row_is_retained_until_repaired() {
     hook_failure_recovers(false, true).await;
 }
 
