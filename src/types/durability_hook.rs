@@ -40,9 +40,11 @@ use waproto::whatsapp as wa;
 /// supported frame can occupy an otherwise empty budget. These are SDK limits,
 /// not exact decoded-heap measurements. Exhaustion ends the connection without
 /// decrypting or acknowledging the rejected stanza; the read loop never waits
-/// for a hook to release capacity. Live processing retains its existing 64-slot
-/// concurrency and per-chat ordering. Persistent storage capacity across process
-/// restarts is the backend/operator's responsibility; the store interface does
+/// for a hook to release capacity. Each connection retains the existing 64-slot
+/// live limit and per-chat receive serialization. Retries may follow newer
+/// deliveries, and an entered hook can outlive its connection. Persistent storage
+/// capacity across process restarts is the backend/operator's responsibility;
+/// the store interface does
 /// not enumerate or impose a quota on pending rows.
 ///
 /// The builder probes the backend's individual pending-inbound store/read/delete
