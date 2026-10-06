@@ -1,4 +1,7 @@
+#![allow(clippy::disallowed_methods)]
+
 use std::mem::{align_of, size_of};
+use waproto::buffa::Message as _;
 use waproto::buffa::{UnknownField, UnknownFieldData, UnknownFields};
 use waproto::whatsapp::__unknown_storage::Storage;
 
@@ -45,4 +48,29 @@ fn empty_retained_capacity_and_replaced_owners_drop_once() {
         drop(storage);
         drop(owned);
     }
+}
+
+#[test]
+fn shared_message_clones_keep_unknown_wire_after_original_is_dropped() {
+    fn check<T: waproto::buffa::Message + Clone>() {
+        // Future field 1000 holds an owned payload.
+        let wire = [0xc2, 0x3e, 4, 11, 22, 33, 44];
+        let message = T::decode_from_slice(&wire).unwrap();
+        let cloned = message.clone();
+        drop(message);
+        assert_eq!(cloned.encode_to_vec(), wire);
+    }
+    check::<waproto::whatsapp::Message>();
+    check::<waproto::whatsapp::ContextInfo>();
+    check::<waproto::whatsapp::BotMetadata>();
+    check::<waproto::whatsapp::MessageContextInfo>();
+
+    let mut message = waproto::whatsapp::Message::default();
+    message.conversation = Some("synthetic clone fixture".into());
+    let cloned = message.clone();
+    message.conversation.as_mut().unwrap().clear();
+    assert_eq!(
+        cloned.conversation.as_deref(),
+        Some("synthetic clone fixture")
+    );
 }

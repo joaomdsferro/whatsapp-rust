@@ -106,6 +106,65 @@ fn protect(attrs: &mut Vec<syn::Attribute>) {
     }
 }
 
+fn share_large_encoders(items: &mut [syn::Item]) {
+    let large: BTreeSet<_> = items
+        .iter()
+        .filter_map(|item| {
+            let syn::Item::Struct(item) = item else {
+                return None;
+            };
+            (item
+                .fields
+                .iter()
+                .filter(|field| {
+                    field
+                        .ident
+                        .as_ref()
+                        .is_none_or(|id| id != "__buffa_unknown_fields")
+                })
+                .count()
+                >= 8)
+                .then(|| item.ident.clone())
+        })
+        .collect();
+    for item in items {
+        match item {
+            syn::Item::Mod(module) => {
+                if let Some((_, items)) = &mut module.content {
+                    share_large_encoders(items);
+                }
+            }
+            syn::Item::Impl(item) => {
+                let Some((_, trait_path, _)) = &item.trait_ else {
+                    continue;
+                };
+                if !trait_path
+                    .segments
+                    .last()
+                    .is_some_and(|s| s.ident == "Message")
+                {
+                    continue;
+                }
+                let syn::Type::Path(ty) = &*item.self_ty else {
+                    continue;
+                };
+                if !ty.path.get_ident().is_some_and(|id| large.contains(id)) {
+                    continue;
+                }
+                for member in &mut item.items {
+                    if let syn::ImplItem::Fn(method) = member
+                        && (method.sig.ident == "compute_size" || method.sig.ident == "write_to")
+                    {
+                        method.attrs.retain(|attr| !attr.path().is_ident("inline"));
+                        method.attrs.push(syn::parse_quote!(#[inline(never)]));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 pub fn finish(out: &Path, package: &str) -> io::Result<BTreeSet<String>> {
     let mut api = BTreeSet::new();
     for (suffix, serde) in [
@@ -120,6 +179,7 @@ pub fn finish(out: &Path, package: &str) -> io::Result<BTreeSet<String>> {
         let mut file = syn::parse_file(&source).map_err(io::Error::other)?;
         Extensible { serde }.visit_file_mut(&mut file);
         if serde {
+            share_large_encoders(&mut file.items);
             ColdStorage { depth: 0 }.visit_file_mut(&mut file);
             let body = syn::parse_file(include_str!("unknown_storage.rs")).expect("storage syntax");
             let body = body.items;
