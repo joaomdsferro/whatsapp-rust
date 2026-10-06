@@ -315,7 +315,9 @@ pub(crate) fn can_current_user_share_history(
 }
 
 fn is_shareable_history_text(content: &waproto::whatsapp::Message) -> bool {
-    use waproto::whatsapp::{Message, MessageContextInfo};
+    use buffa::encoding::varint_len;
+    use buffa::view::ViewEncode as _;
+    use waproto::whatsapp::{MessageContextInfoView, MessageView};
 
     if !content
         .conversation
@@ -324,23 +326,22 @@ fn is_shareable_history_text(content: &waproto::whatsapp::Message) -> bool {
     {
         return false;
     }
-    // Compare against exactly the supported payload instead of enumerating all
-    // forbidden fields. Equality also rejects newly generated and unknown wire
-    // fields, so schema growth cannot silently make extra content shareable.
-    let mut allowed = Message::default();
-    allowed.conversation.clone_from(&content.conversation);
+    // Size only the permitted fields through borrowed views. Every additional
+    // wire field adds bytes, including explicitly present empty submessages
+    // that buffa's semantic equality considers equal to absent fields.
+    let mut allowed = MessageView::default();
+    allowed.conversation = content.conversation.as_deref();
+    let mut permitted_len = allowed.encoded_len() as usize;
     if let Some(context) = content.message_context_info.as_option() {
-        let mut metadata = MessageContextInfo::default();
-        metadata.message_secret.clone_from(&context.message_secret);
+        let mut metadata = MessageContextInfoView::default();
+        metadata.message_secret = context.message_secret.as_deref();
         metadata.reporting_token_version = context.reporting_token_version;
-        allowed.message_context_info = buffa::MessageField::some(metadata);
+        let context_len = metadata.encoded_len();
+        let tag = (waproto::tags::message::MESSAGE_CONTEXT_INFO << 3) | 2;
+        permitted_len +=
+            varint_len(u64::from(tag)) + varint_len(u64::from(context_len)) + context_len as usize;
     }
-    // MessageField equality treats an explicitly present default submessage
-    // as unset. Its wire tag still contributes bytes, so require equal sizes
-    // too: an empty ephemeral/limit-sharing wrapper must remain forbidden.
-    content == &allowed
-        && waproto::codec::message_encoded_len(content)
-            == waproto::codec::message_encoded_len(&allowed)
+    waproto::codec::message_encoded_len(content) == permitted_len
 }
 
 pub(crate) struct SelectedGroupHistory {

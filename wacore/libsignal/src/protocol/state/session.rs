@@ -12,6 +12,7 @@ use subtle::ConstantTimeEq;
 
 use crate::core::curve::KeyType;
 use crate::protocol::counter_lease::CounterLease;
+use crate::protocol::local_field::{future_record_fields, unknown_fields_retained};
 use crate::protocol::ratchet::keys::MessageKeyGenerator;
 use crate::protocol::ratchet::{ChainKey, RootKey};
 use crate::protocol::record_components::{
@@ -188,6 +189,7 @@ impl SkippedKey {
                     + bytes_field_retained(&pb.mac_key)
                     + bytes_field_retained(&pb.iv)
                     + bytes_field_retained(&pb.seed)
+                    + unknown_fields_retained(&pb.__buffa_unknown_fields)
             }
         }
     }
@@ -978,6 +980,7 @@ const RESERVED_SENDER_CHAIN_INDEX_FIELD: u32 =
 
 #[derive(Clone)]
 pub struct SessionRecord {
+    future: buffa::UnknownFields,
     current_session: Option<SessionState>,
     previous_sessions: Arc<Vec<ArchivedSession>>,
     /// Durability lease over sender-chain counters, or the consumer's
@@ -1011,10 +1014,12 @@ fn vec_field_retained(field: &Option<Vec<u8>>) -> usize {
 /// what hangs off it. Counting `size_of::<Chain>()` here as well is how a
 /// report starts growing faster than the memory it describes.
 fn chain_pointed_bytes(chain: &session_structure::Chain) -> usize {
-    vec_field_retained(&chain.sender_ratchet_key)
+    unknown_fields_retained(&chain.__buffa_unknown_fields)
+        + vec_field_retained(&chain.sender_ratchet_key)
         + vec_field_retained(&chain.sender_ratchet_key_private)
         + chain.chain_key.as_option().map_or(0, |key| {
             size_of::<session_structure::chain::ChainKey>() + bytes_field_retained(&key.key)
+                + unknown_fields_retained(&key.__buffa_unknown_fields)
         })
         // The skipped-key backlog: capacity, not length, because the `Vec`
         // keeps its allocation when keys are consumed or pruned.
@@ -1027,6 +1032,7 @@ fn chain_pointed_bytes(chain: &session_structure::Chain) -> usize {
                     + bytes_field_retained(&key.mac_key)
                     + bytes_field_retained(&key.iv)
                     + bytes_field_retained(&key.seed)
+                    + unknown_fields_retained(&key.__buffa_unknown_fields)
             })
             .sum::<usize>()
 }
@@ -1034,7 +1040,8 @@ fn chain_pointed_bytes(chain: &session_structure::Chain) -> usize {
 /// Heap bytes one session state points at, excluding the `SessionStructure`
 /// itself.
 fn session_pointed_bytes(session: &SessionStructure) -> usize {
-    vec_field_retained(&session.local_identity_public)
+    unknown_fields_retained(&session.__buffa_unknown_fields)
+        + vec_field_retained(&session.local_identity_public)
         + vec_field_retained(&session.remote_identity_public)
         + vec_field_retained(&session.root_key)
         + vec_field_retained(&session.alice_base_key)
@@ -1060,11 +1067,13 @@ fn session_pointed_bytes(session: &SessionStructure) -> usize {
                 + vec_field_retained(&pending.local_ratchet_key_private)
                 + vec_field_retained(&pending.local_identity_key)
                 + vec_field_retained(&pending.local_identity_key_private)
+                + unknown_fields_retained(&pending.__buffa_unknown_fields)
         })
         + session.pending_pre_key.as_option().map_or(0, |pending| {
             size_of::<session_structure::PendingPreKey>()
                 + vec_field_retained(&pending.base_key)
                 + vec_field_retained(&pending.kyber_ciphertext)
+                + unknown_fields_retained(&pending.__buffa_unknown_fields)
         })
 }
 
@@ -1179,6 +1188,7 @@ impl SessionRecord {
         Self {
             current_session: None,
             previous_sessions: Arc::new(Vec::new()),
+            future: buffa::UnknownFields::new(),
             lease: CounterLease::default(),
         }
     }
@@ -1187,6 +1197,7 @@ impl SessionRecord {
         Self {
             current_session: Some(state),
             previous_sessions: Arc::new(Vec::new()),
+            future: buffa::UnknownFields::new(),
             lease: CounterLease::default(),
         }
     }
@@ -1214,6 +1225,7 @@ impl SessionRecord {
         Ok(Self {
             current_session,
             previous_sessions: Arc::new(previous_sessions),
+            future: buffa::UnknownFields::new(),
             lease: CounterLease::default(),
         })
     }
@@ -1411,6 +1423,11 @@ impl SessionRecord {
                 .map_err(|_| InvalidSessionError("failed to decode current session protobuf"))?
                 .map(Into::into),
             previous_sessions: Arc::new(previous_sessions),
+            future: future_record_fields(
+                view.__buffa_unknown_fields
+                    .to_owned()
+                    .map_err(|_| InvalidSessionError("failed to decode future record fields"))?,
+            ),
             lease: CounterLease::from_persisted_ceiling(local_fields.reservation),
         };
 
@@ -1688,7 +1705,9 @@ impl SessionRecord {
             .unwrap_or(0);
 
         buf.clear();
-        buf.reserve(current_len + previous_len + reserved_len + incarnation_len);
+        buf.reserve(
+            current_len + previous_len + reserved_len + incarnation_len + self.future.encoded_len(),
+        );
 
         if let Some(session) = current.as_deref()
             && let Some(msg_len) = current_msg_len
@@ -1708,6 +1727,7 @@ impl SessionRecord {
         if let Some(incarnation) = incarnation {
             crate::protocol::local_field::encode_store_incarnation(buf, incarnation);
         }
+        self.future.write_to(buf);
     }
 
     /// Retained in-memory bytes of the current plus archived states.
@@ -1739,7 +1759,7 @@ impl SessionRecord {
                 .iter()
                 .map(|archived| archived.as_bytes().len())
                 .sum::<usize>();
-        size_of::<Self>() + current + previous
+        size_of::<Self>() + current + previous + unknown_fields_retained(&self.future)
     }
 
     pub fn remote_registration_id(&self) -> Result<u32, SignalProtocolError> {
@@ -2241,6 +2261,30 @@ mod tests {
     }
 
     #[test]
+    fn future_session_storage_is_preserved_and_counted() {
+        let future = buffa::UnknownField {
+            number: 200,
+            data: buffa::UnknownFieldData::LengthDelimited(vec![0x77; 8192]),
+        };
+        let mut key = session_structure::chain::MessageKey::default();
+        key.index = Some(7);
+        key.seed = Some(bytes::Bytes::from_static(&[0x42; 32]));
+        key.__buffa_unknown_fields.push(future.clone());
+        let mut chain = session_structure::Chain::default();
+        chain.message_keys.push(key);
+        chain.__buffa_unknown_fields.push(future.clone());
+        let mut session = SessionStructure::default();
+        session.receiver_chains.push(chain);
+        session.__buffa_unknown_fields.push(future.clone());
+        let mut record = SessionRecord::new(SessionState::from_session_structure(session));
+        record.future.push(future);
+        let wire = record.serialize().unwrap();
+        let loaded = SessionRecord::deserialize(&wire).unwrap();
+        assert_eq!(loaded.serialize().unwrap(), wire);
+        assert!(loaded.estimated_size() >= 4 * 8192);
+    }
+
+    #[test]
     fn skipped_seed_preserves_future_fields_through_session_state() {
         let mut seed_only = session_structure::chain::MessageKey::default();
         seed_only.index = Some(7);
@@ -2336,6 +2380,7 @@ mod tests {
                 make_cache_shape_session(1, 1, 2),
             )),
             previous_sessions: Arc::new(archived.iter().map(ArchivedSession::encode).collect()),
+            future: buffa::UnknownFields::new(),
             lease: CounterLease::default(),
         };
 
@@ -2418,6 +2463,7 @@ mod tests {
         let record = SessionRecord {
             current_session: Some(state),
             previous_sessions: Arc::new(Vec::new()),
+            future: buffa::UnknownFields::new(),
             lease: CounterLease::default(),
         };
 
@@ -2448,6 +2494,7 @@ mod tests {
                     skipped: Vec::new(),
                 }),
                 previous_sessions: Arc::new(Vec::new()),
+                future: buffa::UnknownFields::new(),
                 lease: CounterLease::default(),
             }
             .serialize()
@@ -2925,6 +2972,7 @@ mod tests {
                     .map(ArchivedSession::encode)
                     .collect(),
             ),
+            future: buffa::UnknownFields::new(),
             lease: CounterLease::default(),
         };
         let expected = {
@@ -2976,6 +3024,7 @@ mod tests {
                     .map(ArchivedSession::encode)
                     .collect(),
             ),
+            future: buffa::UnknownFields::new(),
             lease: CounterLease::default(),
         };
         let expected = {
