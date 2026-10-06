@@ -79,10 +79,7 @@ struct NoopHttpClient;
 #[async_trait::async_trait]
 impl HttpClient for NoopHttpClient {
     async fn execute(&self, _request: HttpRequest) -> Result<HttpResponse, anyhow::Error> {
-        Ok(HttpResponse {
-            status_code: 200,
-            body: Vec::new(),
-        })
+        Ok(HttpResponse::new(200, Vec::new()))
     }
 }
 
