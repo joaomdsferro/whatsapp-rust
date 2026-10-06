@@ -917,6 +917,137 @@ impl Client {
         kept
     }
 
+    // Keep pending-write state out of every chat lane's inline future. This
+    // allocation exists only when durability is enabled, once per commit batch.
+    async fn buffer_inbound_batch(
+        &self,
+        items: &[InboundMessage],
+        is_drain: bool,
+        keys: &[(String, String)],
+        fingerprints: &mut smallvec::SmallVec<[Option<DispatchFingerprint>; 1]>,
+        dispatch_gate: bool,
+    ) -> bool {
+        let backend = self.persistence_manager.backend();
+        let mut local_arena;
+        let mut shared_arena;
+        let arena: &mut Vec<u8> = if is_drain {
+            shared_arena = self.inbound_commit_batch.arena.lock().await;
+            &mut shared_arena
+        } else {
+            // Exact-size reservation: geometric growth would realloc
+            // several times per live message.
+            local_arena =
+                Vec::with_capacity(waproto::codec::message_encoded_len(&items[0].message));
+            &mut local_arena
+        };
+        arena.clear();
+        let mut ranges = Vec::with_capacity(items.len());
+        for item in items.iter() {
+            let start = arena.len();
+            waproto::codec::message_encode_into(&item.message, arena);
+            ranges.push(start..arena.len());
+            if dispatch_gate {
+                fingerprints.push(
+                    (!crate::features::message_edit::carries_secret_encrypted(&item.message)).then(
+                        || {
+                            MessageDispatch::fingerprint_encoded(
+                                &arena[start..],
+                                item.message.sender_key_distribution_message.is_set(),
+                            )
+                        },
+                    ),
+                );
+            }
+        }
+        // A stanza can carry several distinct payloads under one key.
+        // Keep their order and multiplicity in one opaque record rather
+        // than letting the backend's replace-into retain only the tail.
+        let mut groups: Vec<Vec<usize>> = Vec::new();
+        let mut indexes = std::collections::HashMap::new();
+        for (i, (item, (chat, sender))) in items.iter().zip(&keys).enumerate() {
+            let index = *indexes
+                .entry((chat, sender, &item.info.id))
+                .or_insert_with(|| {
+                    groups.push(Vec::new());
+                    groups.len() - 1
+                });
+            groups[index].push(i);
+        }
+        let records: Vec<Option<Vec<u8>>> = groups
+            .iter()
+            .map(|group| {
+                (group.len() > 1).then(|| {
+                    let parts: Vec<&[u8]> =
+                        group.iter().map(|&i| &arena[ranges[i].clone()]).collect();
+                    durability::encode_pending_parts(&parts)
+                })
+            })
+            .collect();
+        let rows: Vec<PendingInboundRow<'_>> = groups
+            .iter()
+            .zip(&records)
+            .map(|(group, record)| {
+                let i = group[0];
+                PendingInboundRow {
+                    chat: &keys[i].0,
+                    sender: &keys[i].1,
+                    id: &items[i].info.id,
+                    message: record.as_deref().unwrap_or(&arena[ranges[i].clone()]),
+                }
+            })
+            .collect();
+
+        // Fail closed: without a durable buffered copy, do not run the
+        // hook and do not ack — the entries return to the batcher (via
+        // the guard) and the server redelivers once storage recovers.
+        let mut updates = Vec::with_capacity(rows.len());
+        for row in &rows {
+            match backend
+                .get_pending_inbound(row.chat, row.sender, row.id)
+                .await
+            {
+                Ok(None) => updates.push((true, None)),
+                Ok(Some(existing)) => {
+                    match durability::extend_pending_record(&existing, row.message) {
+                        Ok(Some(extended)) => updates.push((true, Some(extended))),
+                        Ok(None) => updates.push((false, None)),
+                        Err(error) => {
+                            log::error!(
+                                "Pending inbound record is corrupt or conflicts with retained parts; preserving both copies and withholding receipt: {error:?}"
+                            );
+                            return false;
+                        }
+                    }
+                }
+                Err(error) => {
+                    log::warn!(
+                        "Cannot check pending inbound record; withholding receipt: {error:?}"
+                    );
+                    return false;
+                }
+            }
+        }
+        let missing: Vec<_> = rows
+            .into_iter()
+            .zip(&updates)
+            .filter(|(_, (write, _))| *write)
+            .map(|(row, (_, bytes))| PendingInboundRow {
+                message: bytes.as_deref().unwrap_or(row.message),
+                ..row
+            })
+            .collect();
+        if !missing.is_empty()
+            && let Err(e) = backend.store_pending_inbound_batch(&missing).await
+        {
+            log::error!(
+                "Failed to buffer inbound batch of {}; suppressing acks for redelivery: {e:?}",
+                items.len()
+            );
+            return false;
+        }
+        true
+    }
+
     /// Commit one batch: durable buffer → Signal flush → hook → clear buffer →
     /// acks → event. Nothing is acked or observable before it is durable (WA
     /// Web's `createSnapshot` ordering); acks precede the event dispatch so a
@@ -1004,131 +1135,16 @@ impl Client {
                 .collect();
 
             let backend = self.persistence_manager.backend();
-            // Encode scope: the buffer lives only through the durable write,
-            // never across the slower flush/hook steps below. Drain reuses the
-            // shared arena (uncontended: the permit serializes drain flushes);
-            // live (batch of one) uses a local buffer so concurrent live
-            // commits never queue on a shared lock while a slow hook runs.
+            if !Box::pin(self.buffer_inbound_batch(
+                &items,
+                is_drain,
+                &keys,
+                &mut fingerprints,
+                dispatch_gate,
+            ))
+            .await
             {
-                let mut local_arena;
-                let mut shared_arena;
-                let arena: &mut Vec<u8> = if is_drain {
-                    shared_arena = self.inbound_commit_batch.arena.lock().await;
-                    &mut shared_arena
-                } else {
-                    // Exact-size reservation: geometric growth would realloc
-                    // several times per live message.
-                    local_arena =
-                        Vec::with_capacity(waproto::codec::message_encoded_len(&items[0].message));
-                    &mut local_arena
-                };
-                arena.clear();
-                let mut ranges = Vec::with_capacity(items.len());
-                for item in items.iter() {
-                    let start = arena.len();
-                    waproto::codec::message_encode_into(&item.message, arena);
-                    ranges.push(start..arena.len());
-                    if dispatch_gate {
-                        fingerprints.push(
-                            (!crate::features::message_edit::carries_secret_encrypted(
-                                &item.message,
-                            ))
-                            .then(|| {
-                                MessageDispatch::fingerprint_encoded(
-                                    &arena[start..],
-                                    item.message.sender_key_distribution_message.is_set(),
-                                )
-                            }),
-                        );
-                    }
-                }
-                // A stanza can carry several distinct payloads under one key.
-                // Keep their order and multiplicity in one opaque record rather
-                // than letting the backend's replace-into retain only the tail.
-                let mut groups: Vec<Vec<usize>> = Vec::new();
-                let mut indexes = std::collections::HashMap::new();
-                for (i, (item, (chat, sender))) in items.iter().zip(&keys).enumerate() {
-                    let index =
-                        *indexes
-                            .entry((chat, sender, &item.info.id))
-                            .or_insert_with(|| {
-                                groups.push(Vec::new());
-                                groups.len() - 1
-                            });
-                    groups[index].push(i);
-                }
-                let records: Vec<Option<Vec<u8>>> = groups
-                    .iter()
-                    .map(|group| {
-                        (group.len() > 1).then(|| {
-                            let parts: Vec<&[u8]> =
-                                group.iter().map(|&i| &arena[ranges[i].clone()]).collect();
-                            durability::encode_pending_parts(&parts)
-                        })
-                    })
-                    .collect();
-                let rows: Vec<PendingInboundRow<'_>> = groups
-                    .iter()
-                    .zip(&records)
-                    .map(|(group, record)| {
-                        let i = group[0];
-                        PendingInboundRow {
-                            chat: &keys[i].0,
-                            sender: &keys[i].1,
-                            id: &items[i].info.id,
-                            message: record.as_deref().unwrap_or(&arena[ranges[i].clone()]),
-                        }
-                    })
-                    .collect();
-
-                // Fail closed: without a durable buffered copy, do not run the
-                // hook and do not ack — the entries return to the batcher (via
-                // the guard) and the server redelivers once storage recovers.
-                let mut updates = Vec::with_capacity(rows.len());
-                for row in &rows {
-                    match backend
-                        .get_pending_inbound(row.chat, row.sender, row.id)
-                        .await
-                    {
-                        Ok(None) => updates.push((true, None)),
-                        Ok(Some(existing)) => {
-                            match durability::extend_pending_record(&existing, row.message) {
-                                Ok(Some(extended)) => updates.push((true, Some(extended))),
-                                Ok(None) => updates.push((false, None)),
-                                Err(error) => {
-                                    log::error!(
-                                        "Pending inbound record is corrupt or conflicts with retained parts; preserving both copies and withholding receipt: {error:?}"
-                                    );
-                                    return false;
-                                }
-                            }
-                        }
-                        Err(error) => {
-                            log::warn!(
-                                "Cannot check pending inbound record; withholding receipt: {error:?}"
-                            );
-                            return false;
-                        }
-                    }
-                }
-                let missing: Vec<_> = rows
-                    .into_iter()
-                    .zip(&updates)
-                    .filter(|(_, (write, _))| *write)
-                    .map(|(row, (_, bytes))| PendingInboundRow {
-                        message: bytes.as_deref().unwrap_or(row.message),
-                        ..row
-                    })
-                    .collect();
-                if !missing.is_empty()
-                    && let Err(e) = backend.store_pending_inbound_batch(&missing).await
-                {
-                    log::error!(
-                        "Failed to buffer inbound batch of {}; suppressing acks for redelivery: {e:?}",
-                        items.len()
-                    );
-                    return false;
-                }
+                return false;
             }
             // A failed flush holds buffered receipts back and restores the
             // batch. A retry reuses compatible stored rows and repeats the
