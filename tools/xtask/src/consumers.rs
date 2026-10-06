@@ -142,6 +142,24 @@ impl ExpectedFailure {
     }
 }
 
+pub(crate) fn verify_mutation(
+    output: &std::process::Output,
+    code: &str,
+    needle: &str,
+    source: &str,
+) -> Result<()> {
+    ExpectedFailure {
+        error_code: code.into(),
+        contains: vec![needle.into()],
+        source: Some(source.into()),
+    }
+    .verify(
+        output.status.success(),
+        &String::from_utf8_lossy(&output.stdout),
+    )
+    .with_context(|| String::from_utf8_lossy(&output.stderr).into_owned())
+}
+
 fn manifest_key(path: &Path) -> Result<String> {
     Ok(path
         .components()

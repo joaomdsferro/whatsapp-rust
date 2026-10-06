@@ -81,42 +81,8 @@ pub fn controls(root: &Path, lane: Lane, toolchain: &str) -> Result<()> {
         std::fs::write(&path, original.replace(before, after))?;
         let result = check()?;
         std::fs::write(path, original)?;
-        verify_control(&result, code, needle)?;
+        consumers::verify_mutation(&result, code, needle, "src/encapsulation/mod.rs")?;
         println!("{lane:?} control caught {needle} ({code}) in the external host");
-    }
-    Ok(())
-}
-
-fn verify_control(output: &std::process::Output, code: &str, needle: &str) -> Result<()> {
-    ensure!(
-        !output.status.success(),
-        "compatibility mutation unexpectedly compiled: {needle}"
-    );
-    let errors = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .filter(|v| v["reason"] == "compiler-message" && v["message"]["level"] == "error")
-        .collect::<Vec<_>>();
-    ensure!(
-        !errors.is_empty(),
-        "mutation failed without compiler evidence: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    for error in errors {
-        let diagnostic = &error["message"];
-        ensure!(
-            diagnostic["code"]["code"] == code
-                && diagnostic["rendered"]
-                    .as_str()
-                    .is_some_and(|s| s.contains(needle))
-                && diagnostic["spans"]
-                    .as_array()
-                    .is_some_and(|spans| spans.iter().any(|s| s["is_primary"] == true
-                        && s["file_name"]
-                            .as_str()
-                            .is_some_and(|p| p.ends_with("src/encapsulation/mod.rs")))),
-            "mutation failed for an unrelated reason: {diagnostic}"
-        );
     }
     Ok(())
 }
@@ -141,6 +107,8 @@ struct Profile {
     name: String,
     defaults: bool,
     features: Vec<String>,
+    // Standalone WASM build. Crypto leaves get their browser entropy backend
+    // from the SDK/core host, exercised by the frozen WASM consumer graph.
     wasm: bool,
 }
 fn sha(value: &str) -> bool {
@@ -224,6 +192,82 @@ fn semver_args(profile: &Profile, baseline: &str) -> Vec<String> {
     args
 }
 
+fn manifest_at(root: &Path, baseline: &str, path: &str) -> Result<toml::Value> {
+    let bytes = capture(
+        Command::new("git")
+            .args(["show", &format!("{baseline}:{path}")])
+            .current_dir(root),
+    )?
+    .stdout;
+    Ok(toml::from_str(std::str::from_utf8(&bytes)?)?)
+}
+
+fn feature_contract(before: &toml::Value, after: &toml::Value, profile: &Profile) -> Result<()> {
+    for feature in profile
+        .features
+        .iter()
+        .map(String::as_str)
+        .chain(profile.defaults.then_some("default"))
+    {
+        let definition = |manifest: &toml::Value| {
+            manifest
+                .get("features")
+                .and_then(|v| v.get(feature))
+                .cloned()
+        };
+        ensure!(
+            definition(before) == definition(after),
+            "{}/{} changed the {feature} feature graph; review the contract explicitly",
+            profile.package,
+            profile.name
+        );
+    }
+    Ok(())
+}
+
+fn baseline_manifest_contracts(
+    root: &Path,
+    baseline: &str,
+    policy: &Policy,
+    meta: &Value,
+) -> Result<()> {
+    let workspace = manifest_at(root, baseline, "Cargo.toml")?;
+    for profile in &policy.profiles {
+        let package = meta["packages"]
+            .as_array()
+            .context("packages")?
+            .iter()
+            .find(|p| p["name"] == profile.package)
+            .context("profile package")?;
+        let path = Path::new(package["manifest_path"].as_str().context("manifest path")?);
+        let relative = path
+            .strip_prefix(root)?
+            .to_str()
+            .context("manifest encoding")?;
+        let before = manifest_at(root, baseline, relative)?;
+        let after: toml::Value = toml::from_str(&std::fs::read_to_string(path)?)?;
+        feature_contract(&before, &after, profile)?;
+        let old_floor = before["package"]
+            .get("rust-version")
+            .and_then(toml::Value::as_str)
+            .or_else(|| {
+                workspace
+                    .get("workspace")?
+                    .get("package")?
+                    .get("rust-version")?
+                    .as_str()
+            })
+            .context("baseline must declare an MSRV")?;
+        let current_floor = package["rust_version"].as_str().context("published MSRV")?;
+        ensure!(
+            old_floor == current_floor,
+            "{} changed MSRV from {old_floor} to {current_floor}; review the compatibility policy explicitly",
+            profile.package
+        );
+    }
+    Ok(())
+}
+
 pub fn run(root: &Path, release: bool, lane: Lane, toolchain: &str) -> Result<u8> {
     let policy: Policy = serde_json::from_slice(&std::fs::read(root.join(POLICY))?)?;
     let meta: Value = serde_json::from_slice(
@@ -250,6 +294,7 @@ pub fn run(root: &Path, release: bool, lane: Lane, toolchain: &str) -> Result<u8
                 .args(["merge-base", "--is-ancestor", baseline, "HEAD"])
                 .current_dir(root),
         )?;
+        baseline_manifest_contracts(root, baseline, &policy, &meta)?;
         if lane == Lane::Native {
             for profile in &policy.profiles {
                 // Proc-macro signatures do not establish expansion compatibility.
@@ -355,5 +400,18 @@ mod tests {
         assert!(args.windows(2).any(|w| w == ["--release-type", "patch"]));
         assert!(args.contains(&"--only-explicit-features".into()));
         assert!(!args.contains(&"--all-features".into()));
+    }
+
+    #[test]
+    fn default_and_opt_in_contracts_cannot_change_silently() {
+        let mut policy = policy();
+        let before: toml::Value =
+            toml::from_str("[features]\ndefault = [\"host\"]\nhost = [\"dep:adapter\"]").unwrap();
+        let after: toml::Value = toml::from_str("[features]\ndefault = []\nhost = []").unwrap();
+        assert!(feature_contract(&before, &after, &policy.profiles[0]).is_err());
+        policy.profiles[0].features.clear();
+        policy.profiles[0].defaults = true;
+        assert!(feature_contract(&before, &after, &policy.profiles[0]).is_err());
+        feature_contract(&before, &before, &policy.profiles[0]).unwrap();
     }
 }

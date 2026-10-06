@@ -240,6 +240,16 @@ fn run_staged(
     packages: &BTreeMap<String, Package>,
     order: &[String],
 ) -> Result<u8> {
+    let commit = String::from_utf8(
+        capture(
+            Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(root),
+        )?
+        .stdout,
+    )?;
+    let commit = commit.trim();
+    println!("Packaging commit {commit} for {lane:?}");
     let artifacts = stage.join("artifacts");
     let extracted = stage.join("packages");
     let mut command = Command::new("cargo");
@@ -280,6 +290,12 @@ fn run_staged(
             );
         }
         let path = extracted.join(&stem);
+        let vcs: Value =
+            serde_json::from_slice(&std::fs::read(path.join(".cargo_vcs_info.json"))?)?;
+        ensure!(
+            vcs["git"]["sha1"] == commit && vcs["git"]["dirty"] != true,
+            "{name} was not packaged from clean commit {commit}"
+        );
         ensure!(
             path.join("Cargo.toml").is_file(),
             "package manifest missing: {name}"
@@ -323,7 +339,16 @@ fn run_staged(
             &capture(
                 Command::new("cargo")
                     .arg(format!("+{toolchain}"))
-                    .args(["metadata", "--format-version", "1", "--manifest-path"])
+                    // Inspect every optional edge before the isolated builds.
+                    // This resolves metadata only; each build still uses its
+                    // registered profile, never an all-features compilation.
+                    .args([
+                        "metadata",
+                        "--all-features",
+                        "--format-version",
+                        "1",
+                        "--manifest-path",
+                    ])
                     .arg(&manifest)
                     .current_dir(stage)
                     .env_remove("CARGO_ENCODED_RUSTFLAGS")
