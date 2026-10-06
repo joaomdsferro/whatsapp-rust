@@ -59,41 +59,45 @@ struct Stanza {
     items: Vec<InboundMessage>,
     // Parts produced by this delivery, distinct from retained/replayed parts.
     fresh: Vec<InboundMessage>,
+    pending_keys: Vec<Key>,
     state: State,
     receipt: bool,
     ticket: Option<InboundCommitTicket>,
     admissions: Vec<Arc<InboundAdmission>>,
     commit_waiters: Vec<futures::channel::oneshot::Sender<()>>,
 }
+// Match occurrences, not a set: [A,A] remains two parts, but another
+// delivery of [A,A] contributes no additional copies. Reuse dispatch's SKDM
+// equivalence without copying the protobuf schema or dropping unknown fields.
+pub(super) fn merge_parts(items: &mut Vec<InboundMessage>, fresh: Vec<InboundMessage>) {
+    if items.is_empty() {
+        *items = fresh;
+        return;
+    }
+    let mut prior = HashMap::<DispatchFingerprint, usize>::new();
+    let mut scratch = Vec::new();
+    for item in items.iter() {
+        *prior
+            .entry(MessageDispatch::fingerprint_into(
+                &item.message,
+                &mut scratch,
+            ))
+            .or_default() += 1;
+    }
+    for item in fresh {
+        let fingerprint = MessageDispatch::fingerprint_into(&item.message, &mut scratch);
+        if let Some(count) = prior.get_mut(&fingerprint)
+            && *count != 0
+        {
+            *count -= 1;
+        } else {
+            items.push(item);
+        }
+    }
+}
 impl Stanza {
     fn reconcile(&mut self) {
-        if self.items.is_empty() {
-            self.items = std::mem::take(&mut self.fresh);
-            return;
-        }
-        // Match occurrences, not a set of contents: [A,A] remains two parts,
-        // while another delivery of [A,A] contributes no additional copies.
-        // Reuse the dispatch fingerprint's established SKDM equivalence.
-        let mut prior = HashMap::<DispatchFingerprint, usize>::new();
-        let mut scratch = Vec::new();
-        for item in &self.items {
-            *prior
-                .entry(MessageDispatch::fingerprint_into(
-                    &item.message,
-                    &mut scratch,
-                ))
-                .or_default() += 1;
-        }
-        for item in self.fresh.drain(..) {
-            let fingerprint = MessageDispatch::fingerprint_into(&item.message, &mut scratch);
-            if let Some(count) = prior.get_mut(&fingerprint)
-                && *count != 0
-            {
-                *count -= 1;
-            } else {
-                self.items.push(item);
-            }
-        }
+        merge_parts(&mut self.items, std::mem::take(&mut self.fresh));
     }
 }
 #[derive(Default)]
@@ -183,6 +187,7 @@ impl InboundRetention {
                 id,
                 items: Vec::new(),
                 fresh: Vec::new(),
+                pending_keys: Vec::new(),
                 state: State::Collecting,
                 receipt: false,
                 ticket: None,
@@ -244,12 +249,27 @@ impl InboundRetention {
             id,
         }
     }
-    pub(crate) fn seed_replay(&self, items: Vec<InboundMessage>) {
-        let Some(first) = items.first() else { return };
+    pub(crate) fn replay_items(&self, info: &MessageInfo) -> Option<Arc<[InboundMessage]>> {
+        let stanzas = lock(&self.stanzas);
+        let stanza = stanzas.get(&key(info))?;
+        (!matches!(stanza.state, State::Collecting | State::Committing))
+            .then(|| stanza.items.clone().into())
+    }
+    pub(crate) fn is_collecting(&self, info: &MessageInfo) -> bool {
+        lock(&self.stanzas)
+            .get(&key(info))
+            .is_some_and(|s| s.state == State::Collecting)
+    }
+    pub(super) fn seed_replay(&self, replay: durability::PendingReplay) {
+        let Some(first) = replay.items.first() else {
+            return;
+        };
         let mut stanzas = lock(&self.stanzas);
         if let Some(stanza) = stanzas.get_mut(&key(&first.info)) {
-            debug_assert!(stanza.items.is_empty());
-            stanza.items = items;
+            merge_parts(&mut stanza.items, replay.items);
+            stanza.pending_keys.extend(replay.keys);
+            stanza.pending_keys.sort();
+            stanza.pending_keys.dedup();
         }
     }
     pub(crate) fn seal(&self, info: &MessageInfo, draining: bool) -> (Arc<[InboundMessage]>, bool) {
@@ -270,14 +290,16 @@ impl InboundRetention {
         };
         (stanza.items.clone().into(), false)
     }
-    pub(crate) fn batched(&self, items: &[InboundMessage]) {
+    pub(crate) fn batched(&self, items: &[InboundMessage], owner: Option<&RetentionCommit>) {
         let mut stanzas = lock(&self.stanzas);
         for item in items {
             if let Some(stanza) = stanzas.get_mut(&key(&item.info))
                 && stanza.state != State::Collecting
+                && (stanza.state != State::Committing
+                    || owner.is_some_and(|owner| owner.owns(&item.info)))
             {
-                // An older snapshot may be restored while a newer producer
-                // extends this identity after a connection reset.
+                // Only the owning commit can restore Committing to Batched.
+                // An older refused snapshot can race a newer producer's hook.
                 stanza.state = State::Batched;
             }
         }
@@ -431,6 +453,14 @@ impl RetentionCommit {
             }
         }
         canonical.into()
+    }
+    pub(crate) fn pending_keys(&self) -> Vec<(String, String, String)> {
+        let stanzas = lock(&self.retention.stanzas);
+        self.keys
+            .iter()
+            .filter_map(|key| stanzas.get(key))
+            .flat_map(|stanza| stanza.pending_keys.iter().cloned())
+            .collect()
     }
     pub(crate) fn durable(&self) {
         if self.keys.is_empty() {
@@ -766,6 +796,29 @@ mod tests {
         assert!(retention.retry_items().is_empty());
     }
     #[tokio::test]
+    async fn completed_guard_drop_cannot_remove_a_newer_collection() {
+        let retention = Arc::new(InboundRetention::default());
+        let first = item("same", "old");
+        retention.begin(&first.info, retention.admit(100)).await;
+        retention
+            .stage(std::slice::from_ref(&first), false)
+            .unwrap();
+        let (items, _) = retention.seal(&first.info, false);
+        let mut old = retention.commit(&items).unwrap();
+        old.complete();
+        retention.begin(&first.info, retention.admit(200)).await;
+        retention.stage(&[item("same", "new")], false).unwrap();
+        drop(old);
+        assert_eq!(retention.stats(), (1, 200));
+        let (new, _) = retention.seal(&first.info, false);
+        assert_eq!(new.len(), 1);
+        assert_eq!(new[0].message.conversation.as_deref(), Some("new"));
+        let mut commit = retention.commit(&new).unwrap();
+        commit.complete();
+        drop(commit);
+        assert_eq!(retention.stats(), (0, 0));
+    }
+    #[tokio::test]
     async fn restoring_an_old_snapshot_does_not_seal_a_new_producer() {
         let retention = Arc::new(InboundRetention::default());
         let first = item("same-identity", "first");
@@ -776,7 +829,7 @@ mod tests {
         let (old_items, _) = retention.seal(&first.info, true);
         assert!(!retention.begin(&first.info, retention.admit(100)).await);
         assert!(retention.commit(&old_items).is_none());
-        retention.batched(&old_items);
+        retention.batched(&old_items, None);
         retention
             .stage(&[item("same-identity", "second")], false)
             .unwrap();

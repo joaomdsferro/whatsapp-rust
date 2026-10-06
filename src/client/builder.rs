@@ -838,12 +838,22 @@ async fn probe_durability_backend(
         .map_err(map_err)?;
     let stored = backend
         .get_pending_inbound(PROBE_JID, PROBE_JID, &probe_id)
-        .await
-        .map_err(map_err)?;
+        .await;
+    let candidates = backend
+        .get_pending_inbound_for_message(PROBE_JID, &probe_id)
+        .await;
+    // Even a failed read probe must clean up its own uniquely named row.
     backend
         .delete_pending_inbound(PROBE_JID, PROBE_JID, &probe_id)
         .await
         .map_err(map_err)?;
+    let stored = stored.map_err(map_err)?;
+    let candidates = candidates.map_err(map_err)?;
+    if candidates != [(PROBE_JID.to_owned(), PROBE_PAYLOAD.to_vec())] {
+        return Err(ClientBuilderError::UnsupportedDurabilityBackend(
+            "pending-inbound participant lookup did not round-trip".to_owned(),
+        ));
+    }
 
     if stored.as_deref() != Some(PROBE_PAYLOAD) {
         return Err(ClientBuilderError::UnsupportedDurabilityBackend(

@@ -330,7 +330,9 @@ impl Drop for ReinsertGuard<'_> {
         // the next enqueue arms a fresh one, and the drain-end/teardown
         // flushes cover the gap regardless.
         state.timer_armed = false;
-        self.batcher.retention.batched(&restored);
+        self.batcher
+            .retention
+            .batched(&restored, self.retained.as_ref());
         state.entries = restored;
         if let Some(ticket) = self.commit_ticket.take() {
             if state.commit_ticket.is_some() {
@@ -407,7 +409,7 @@ impl Client {
                 InboundCommitState::Failed
             };
         }
-        self.inbound_commit_batch.retention.batched(&items);
+        self.inbound_commit_batch.retention.batched(&items, None);
         let mut timer_epoch = None;
         let mut ticket = None;
         for item in items.iter().cloned() {
@@ -1163,43 +1165,27 @@ impl Client {
             }
             hook_committed = true;
 
-            // Cleared for every stanza that arrived, not just the ones kept: a
-            // pending row is keyed on the sender exactly as that delivery spelled
-            // it, while the collapse folds spellings together. Deleting only the
-            // kept spelling would leave a row that a later resend replays as an
-            // already committed message. Deleting a row that is not there is a
-            // no-op, so the superset is free.
-            let arrived_keys: Vec<(String, String)>;
-            let delete_keys: Vec<PendingInboundKey<'_>> = if arrived.len() == items.len() {
-                items
-                    .iter()
-                    .zip(&keys)
-                    .map(|(item, (chat, sender))| PendingInboundKey {
-                        chat,
-                        sender,
-                        id: &item.info.id,
-                    })
-                    .collect()
-            } else {
-                arrived_keys = arrived
-                    .iter()
-                    .map(|m| {
-                        (
-                            m.info.source.chat.to_string(),
-                            m.info.source.sender.to_string(),
-                        )
-                    })
-                    .collect();
-                arrived
-                    .iter()
-                    .zip(&arrived_keys)
-                    .map(|(item, (chat, sender))| PendingInboundKey {
-                        chat,
-                        sender,
-                        id: &item.info.id,
-                    })
-                    .collect()
-            };
+            // Remove only keys loaded for this commit plus rows this batch
+            // wrote. Never delete by normalized participant: a row we did not
+            // read might contain another uncommitted payload.
+            let mut settled_keys = reinsert
+                .retained
+                .as_ref()
+                .expect("retention commit acquired")
+                .pending_keys();
+            settled_keys.extend(arrived.iter().chain(items.iter()).map(|item| {
+                (
+                    item.info.source.chat.to_string(),
+                    item.info.source.sender.to_string(),
+                    item.info.id.to_string(),
+                )
+            }));
+            settled_keys.sort();
+            settled_keys.dedup();
+            let delete_keys: Vec<_> = settled_keys
+                .iter()
+                .map(|(chat, sender, id)| PendingInboundKey { chat, sender, id })
+                .collect();
             if let Err(e) = backend.delete_pending_inbound_batch(&delete_keys).await {
                 // Leftover rows replay as duplicates; the idempotent hook
                 // re-commits and the replay path clears them.

@@ -2,7 +2,7 @@
 
 use super::*;
 use smallvec::SmallVec;
-use wacore::types::events::{BatchOrigin, InboundMessage};
+use wacore::types::events::BatchOrigin;
 
 /// Parsed session envelope with explicit retry/ownership semantics.
 ///
@@ -613,39 +613,11 @@ impl Client {
             }
             self.inbound_commit_batch.remove_retained_identity(&info);
             if fresh {
-                let backend = self.persistence_manager.backend();
-                match backend
-                    .get_pending_inbound(
-                        &info.source.chat.to_string(),
-                        &info.source.sender.to_string(),
-                        &info.id,
-                    )
-                    .await
-                {
-                    Ok(Some(bytes)) => match durability::decode_pending_parts(&bytes) {
-                        Ok(messages) => {
-                            let items: Vec<_> = messages
-                                .into_iter()
-                                .map(|message| {
-                                    InboundMessage::builder()
-                                        .message(Arc::new(message))
-                                        .info(Arc::clone(&info))
-                                        .build()
-                                })
-                                .collect();
-                            self.inbound_commit_batch.retention.seed_replay(items);
-                        }
-                        Err(error) => {
-                            log::error!(
-                                "Pending inbound record cannot be decoded; preserving it without decrypting another delivery: {error:?}"
-                            );
-                            return;
-                        }
-                    },
-                    Ok(None) => {}
+                match self.load_pending_inbound(&info).await {
+                    Ok(replay) => self.inbound_commit_batch.retention.seed_replay(replay),
                     Err(error) => {
                         log::warn!(
-                            "Pending inbound read failed before decrypt; withholding receipt: {error:?}"
+                            "Pending inbound lookup failed before decrypt; preserving all records and withholding receipt: {error:?}"
                         );
                         return;
                     }

@@ -1191,6 +1191,23 @@ pub trait ProtocolStore: Send + Sync {
         Err(unsupported_pending_inbound())
     }
 
+    /// Read every pending row for `(chat, id)` in this backend's device scope.
+    /// Return each original sender key and its opaque bytes without changing
+    /// either. The SDK, not the backend, decides which participants identify
+    /// the same message; rows from other senders must remain available.
+    ///
+    /// Required by the durability hook to recover legacy device-qualified group
+    /// participants after restart. Returning an incomplete set can lose pending
+    /// payloads. Unsupported implementations must return an error, not an empty
+    /// set; the builder probes this operation before enabling the hook.
+    async fn get_pending_inbound_for_message(
+        &self,
+        _chat: &str,
+        _id: &str,
+    ) -> Result<Vec<(String, Vec<u8>)>> {
+        Err(unsupported_pending_inbound())
+    }
+
     /// Remove a buffered inbound message once its durability hook has committed.
     async fn delete_pending_inbound(&self, _chat: &str, _sender: &str, _id: &str) -> Result<()> {
         Err(unsupported_pending_inbound())
