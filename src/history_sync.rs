@@ -1478,9 +1478,10 @@ mod tests {
         process_call_history_chunk(
             &client,
             vec![
-                wa::CallLogRecord {
-                    call_creator_jid: Some("15550000001:8@c.us".into()),
-                    ..Default::default()
+                {
+                    let mut proto = wa::CallLogRecord::default();
+                    proto.call_creator_jid = Some("15550000001:8@c.us".into());
+                    proto
                 };
                 2
             ],
