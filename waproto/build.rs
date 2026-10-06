@@ -78,7 +78,6 @@ fn main() -> std::io::Result<()> {
     #[allow(clippy::disallowed_methods)]
     let mut fds = FileDescriptorSet::decode_from_slice(&std::fs::read("src/whatsapp.desc")?)
         .map_err(std::io::Error::other)?;
-    apply_local_fields(&mut fds)?;
     names::apply(
         &mut fds,
         names::TYPES,
@@ -86,6 +85,9 @@ fn main() -> std::io::Result<()> {
         names::ENUM_VALUES,
         names::ONEOFS,
     )?;
+    // Local persisted fields target the frozen names, so an upstream rename
+    // cannot detach a persistence extension from its message.
+    apply_local_fields(&mut fds)?;
 
     // Emit the wire-tag consts (field numbers) for hand-written partial decoders.
     generate_tags(&fds, &out_path.join("tags.rs"))?;

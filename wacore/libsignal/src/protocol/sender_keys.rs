@@ -1737,6 +1737,10 @@ mod tests {
         // Budget, not contract: the total floats with the protobuf runtime
         // layout, so only growth fails. Rebaseline per
         // [layout asserts](../../../../agent_docs/testing.md).
+        // Preserving future wire fields adds one UnknownFields container to
+        // the generated structure (24 bytes on 64-bit, 12 on 32-bit). Keep
+        // that explicit so this allowance cannot hide other layout growth.
+        let unknown_fields = size_of::<buffa::UnknownFields>();
         #[cfg(target_pointer_width = "64")]
         {
             assert!(
@@ -1745,9 +1749,10 @@ mod tests {
                 size_of::<SenderKeyState>()
             );
             assert!(
-                size_of::<SenderKeyStateStructure>() <= 48,
-                "SenderKeyStateStructure grew to {} B (budget 48)",
-                size_of::<SenderKeyStateStructure>()
+                size_of::<SenderKeyStateStructure>() <= 48 + unknown_fields,
+                "SenderKeyStateStructure grew to {} B (budget {})",
+                size_of::<SenderKeyStateStructure>(),
+                48 + unknown_fields
             );
         }
         #[cfg(target_pointer_width = "32")]
@@ -1758,9 +1763,10 @@ mod tests {
                 size_of::<SenderKeyState>()
             );
             assert!(
-                size_of::<SenderKeyStateStructure>() <= 28,
-                "SenderKeyStateStructure grew to {} B (budget 28)",
-                size_of::<SenderKeyStateStructure>()
+                size_of::<SenderKeyStateStructure>() <= 28 + unknown_fields,
+                "SenderKeyStateStructure grew to {} B (budget {})",
+                size_of::<SenderKeyStateStructure>(),
+                28 + unknown_fields
             );
         }
     }

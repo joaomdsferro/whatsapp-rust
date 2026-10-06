@@ -73,7 +73,6 @@ fn schema(new: bool) -> FileDescriptorSet {
         ..Default::default()
     }
 }
-#[allow(clippy::disallowed_methods)]
 pub fn generate(root: &std::path::Path) -> std::io::Result<()> {
     let mut previous: Option<String> = None;
     for new in [false, true] {
@@ -156,12 +155,13 @@ pub fn generate(root: &std::path::Path) -> std::io::Result<()> {
     Ok(())
 }
 
+#[allow(clippy::disallowed_methods)] // descriptor fixture, not an application message
 fn emit(
     fds: &FileDescriptorSet,
     out: &std::path::Path,
     pointer: buffa_build::PointerRepr,
 ) -> std::io::Result<std::collections::BTreeSet<String>> {
-    std::fs::create_dir_all(&out)?;
+    std::fs::create_dir_all(out)?;
     let desc = out.join("contract.desc");
     let bytes = fds.encode_to_vec();
     if !std::fs::read(&desc).is_ok_and(|current| current == bytes) {
@@ -178,10 +178,10 @@ fn emit(
         .message_attribute(".", "#[serde(default)]")
         .enum_attribute(".", "#[derive(serde::Serialize, serde::Deserialize)]")
         .oneof_attribute(".", "#[derive(serde::Serialize, serde::Deserialize)]")
-        .out_dir(&out)
+        .out_dir(out)
         .compile()
         .map_err(|e| std::io::Error::other(e.to_string()))?;
-    let mut api = emission::finish(&out, "contract")?;
+    let mut api = emission::finish(out, "contract")?;
     api.extend(names::wire_api(fds));
     Ok(api)
 }
