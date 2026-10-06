@@ -77,6 +77,8 @@ struct Invocation {
     #[serde(default)]
     bin: Option<String>,
     #[serde(default)]
+    test: Option<String>,
+    #[serde(default)]
     lib: bool,
     /// A directed negative binary must fail for this diagnostic, not a missing dependency.
     #[serde(default)]
@@ -241,8 +243,11 @@ fn validate(root: &Path, consumers: &[Consumer]) -> Result<()> {
                 consumer.manifest
             );
             ensure!(
-                !invocation.lib || invocation.bin.is_none(),
-                "{}: select lib or bin, not both",
+                usize::from(invocation.lib)
+                    + usize::from(invocation.bin.is_some())
+                    + usize::from(invocation.test.is_some())
+                    <= 1,
+                "{}: select one lib, bin or test target",
                 consumer.manifest
             );
             ensure!(
@@ -318,6 +323,9 @@ impl Invocation {
         }
         if let Some(bin) = &self.bin {
             args.extend(["--bin".into(), bin.clone()]);
+        }
+        if let Some(test) = &self.test {
+            args.extend(["--test".into(), test.clone()]);
         }
         if self.lib {
             args.push("--lib".into());
@@ -599,6 +607,28 @@ mod tests {
         assert!(validate(root.path(), &consumers).is_err());
         consumers[0].commands[0].lanes = vec![Lane::Msrv];
         assert!(validate(root.path(), &consumers).is_err());
+    }
+    #[test]
+    fn named_tests_are_explicit_and_target_selectors_are_exclusive() {
+        let (root, mut consumers) = fixture();
+        consumers[0].commands[0].test = Some("event_delivery".into());
+        assert!(validate(root.path(), &consumers).is_ok());
+        let args = consumers[0].commands[0].args(&consumers[0], Lane::Native);
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--test", "event_delivery"])
+        );
+        consumers[0].commands[0].lib = true;
+        assert!(validate(root.path(), &consumers).is_err());
+        consumers[0].commands[0].lib = false;
+        consumers[0].commands[0].bin = Some("probe".into());
+        assert!(validate(root.path(), &consumers).is_err());
+        assert!(
+            serde_json::from_str::<Invocation>(
+                r#"{"lanes":["native"],"mode":"test","test":"event_delivery","unknown":true}"#
+            )
+            .is_err()
+        );
     }
     #[test]
     fn refuses_wasm_test_run_and_missing_locks() {
