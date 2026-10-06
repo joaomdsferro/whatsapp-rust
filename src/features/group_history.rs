@@ -335,7 +335,12 @@ fn is_shareable_history_text(content: &waproto::whatsapp::Message) -> bool {
         metadata.reporting_token_version = context.reporting_token_version;
         allowed.message_context_info = buffa::MessageField::some(metadata);
     }
+    // MessageField equality treats an explicitly present default submessage
+    // as unset. Its wire tag still contributes bytes, so require equal sizes
+    // too: an empty ephemeral/limit-sharing wrapper must remain forbidden.
     content == &allowed
+        && waproto::codec::message_encoded_len(content)
+            == waproto::codec::message_encoded_len(&allowed)
 }
 
 pub(crate) struct SelectedGroupHistory {
