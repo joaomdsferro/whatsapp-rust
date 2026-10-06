@@ -7,6 +7,9 @@ use wacore::types::events::{ChannelEventHandler, InboundMessage};
 #[derive(Default)]
 struct Hook {
     fail: AtomicBool,
+    pause_first: AtomicBool,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
     attempts: AtomicUsize,
     committed: AtomicUsize,
 }
@@ -15,6 +18,10 @@ struct Hook {
 impl crate::types::durability_hook::InboundDurabilityHook for Hook {
     async fn on_messages(&self, _: Arc<Client>, items: &[InboundMessage]) -> anyhow::Result<()> {
         self.attempts.fetch_add(items.len(), Ordering::SeqCst);
+        if self.pause_first.swap(false, Ordering::SeqCst) {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
         anyhow::ensure!(
             !self.fail.load(Ordering::SeqCst),
             "synthetic consumer failure"
@@ -178,7 +185,7 @@ impl Fixture {
 }
 
 #[tokio::test]
-async fn a09_live_buffer_failure_then_exact_ciphertext_redelivery_loses_body() {
+async fn a09_live_buffer_failure_then_exact_ciphertext_redelivery_recovers_body() {
     let mut f = Fixture::new("A09_LIVE_BUFFER", false).await;
     assert!(!f.persisted_session().await);
     f.buffer_failure(true);
@@ -197,10 +204,10 @@ async fn a09_live_buffer_failure_then_exact_ciphertext_redelivery_loses_body() {
     assert_eq!(
         f.receipts(),
         1,
-        "the same ciphertext is acknowledged as a ratchet duplicate"
+        "the original plaintext is committed before its receipt"
     );
-    assert_eq!(f.hook.committed.load(Ordering::SeqCst), 0);
-    assert!(f.published().is_empty());
+    assert_eq!(f.hook.committed.load(Ordering::SeqCst), 1);
+    assert_eq!(f.published(), ["synthetic retained body"]);
 }
 
 #[tokio::test]
@@ -341,7 +348,7 @@ async fn a09_corrupt_replay_row_is_retained_until_repaired() {
 }
 
 #[tokio::test]
-async fn a09_expired_pending_row_survives_startup_but_not_regular_sweep() {
+async fn a09_old_pending_row_survives_startup_and_regular_sweep() {
     let mut f = Fixture::new("A09_RETENTION", false).await;
     f.hook.fail.store(true, Ordering::SeqCst);
     f.receive().await;
@@ -357,14 +364,14 @@ async fn a09_expired_pending_row_survives_startup_but_not_regular_sweep() {
     );
     f.client.run_retention_cleanup(0).await;
     assert!(
-        f.pending().await.is_none(),
-        "the regular sweep expires eight-day-old pending rows"
+        f.pending().await.is_some(),
+        "elapsed time cannot establish consumer commit"
     );
     f.hook.fail.store(false, Ordering::SeqCst);
     f.receive().await;
     assert_eq!(f.receipts(), 1);
-    assert_eq!(f.hook.committed.load(Ordering::SeqCst), 0);
-    assert!(f.published().is_empty());
+    assert_eq!(f.hook.committed.load(Ordering::SeqCst), 1);
+    assert_eq!(f.published(), ["synthetic retained body"]);
 }
 
 #[tokio::test]
@@ -435,17 +442,202 @@ async fn group_buffer_failure(drain: bool) {
         assert_eq!(f.published(), ["synthetic retained group body"]);
     } else {
         f.receive().await;
-        assert_eq!(f.hook.committed.load(Ordering::SeqCst), 0);
-        assert!(f.published().is_empty());
+        assert_eq!(f.hook.committed.load(Ordering::SeqCst), 1);
+        assert_eq!(f.published(), ["synthetic retained group body"]);
     }
     assert_eq!(f.receipts(), 1);
 }
 
 #[tokio::test]
-async fn a09_group_live_buffer_failure_loses_body_on_redelivery() {
+async fn a09_group_live_buffer_failure_recovers_body_on_redelivery() {
     group_buffer_failure(false).await;
 }
 #[tokio::test]
 async fn a09_group_drain_buffer_failure_retains_body_for_recovery() {
     group_buffer_failure(true).await;
+}
+
+#[tokio::test]
+async fn retained_live_plaintext_survives_real_connection_cleanup() {
+    let mut f = Fixture::new("RESET_BUFFER", false).await;
+    f.buffer_failure(true);
+    f.receive().await;
+    assert_eq!(f.client.inbound_commit_batch.retention.stats().0, 1);
+    f.client.cleanup_connection_state().await;
+    assert_eq!(f.client.inbound_commit_batch.retention.stats().0, 1);
+    assert_eq!(f.hook.committed.load(Ordering::SeqCst), 0);
+    f.buffer_failure(false);
+    f.receive().await;
+    assert!(
+        f.client
+            .flush_inbound_commits_under_permit(true, None, None)
+            .await
+    );
+    assert_eq!(f.hook.committed.load(Ordering::SeqCst), 1);
+    assert_eq!(f.published(), ["synthetic retained body"]);
+    assert_eq!(f.client.inbound_commit_batch.retention.stats().0, 0);
+}
+
+#[tokio::test]
+async fn cancelling_receive_waiter_keeps_the_owned_hook_commit() {
+    let f = Fixture::new("CANCEL_COMMIT", false).await;
+    f.hook.pause_first.store(true, Ordering::SeqCst);
+    let task = tokio::spawn(f.client.clone().handle_incoming_message(f.stanza.clone()));
+    f.hook.entered.notified().await;
+    task.abort();
+    let _ = task.await;
+    assert!(f.pending().await.is_some());
+    assert_eq!(f.receipts(), 0);
+    assert_eq!(f.client.inbound_commit_batch.retention.stats().0, 1);
+    f.hook.release.notify_one();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while f.client.inbound_commit_batch.retention.stats().0 != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    crate::test_utils::wait_for_outbound_tasks(&f.client).await;
+    assert_eq!(f.hook.committed.load(Ordering::SeqCst), 1);
+    assert_eq!(f.receipts(), 1);
+    assert_eq!(f.published(), ["synthetic retained body"]);
+}
+
+#[tokio::test]
+async fn shutdown_is_bounded_while_a_hook_owns_retained_plaintext() {
+    let f = Fixture::new("SHUTDOWN_COMMIT", false).await;
+    f.hook.pause_first.store(true, Ordering::SeqCst);
+    let task = tokio::spawn(f.client.clone().handle_incoming_message(f.stanza.clone()));
+    f.hook.entered.notified().await;
+    tokio::time::timeout(std::time::Duration::from_secs(3), f.client.shutdown())
+        .await
+        .unwrap();
+    assert!(f.pending().await.is_some());
+    assert_eq!(f.client.inbound_commit_batch.retention.stats().0, 1);
+    assert_eq!(f.hook.committed.load(Ordering::SeqCst), 0);
+    f.hook.release.notify_one();
+    task.await.unwrap();
+    assert_eq!(f.hook.committed.load(Ordering::SeqCst), 1);
+    assert_eq!(f.published(), ["synthetic retained body"]);
+}
+
+#[tokio::test]
+async fn exhausted_admission_returns_before_decrypt_or_hook() {
+    let f = Fixture::new("CAPACITY", false).await;
+    let leases: Vec<_> = (0..400)
+        .map(|_| f.client.inbound_commit_batch.retention.admit(1).unwrap())
+        .collect();
+    let mut cancelled = false;
+    tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        crate::handlers::message::MessageHandler::handle_inline(
+            f.client.clone(),
+            f.stanza.clone(),
+            &mut cancelled,
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(cancelled);
+    assert!(f.client.connection_shutdown_signal().is_fired());
+    assert!(!f.persisted_session().await);
+    assert!(f.pending().await.is_none());
+    assert_eq!(f.hook.attempts.load(Ordering::SeqCst), 0);
+    assert_eq!(f.receipts(), 0);
+    drop(leases);
+    assert_eq!(f.client.inbound_commit_batch.retention.stats(), (0, 0));
+}
+
+async fn encrypted_parts(
+    client: &Arc<Client>,
+    sender: &str,
+    id: &str,
+    bodies: &[&str],
+) -> Arc<OwnedNodeRef> {
+    let (bundle, own) = bobs_prekey_bundle(client).await;
+    let mut peer = AlicePeer::new(sender).await;
+    peer.install_bob_session(&own.to_protocol_address(), &bundle)
+        .await;
+    let mut children = Vec::new();
+    for body in bodies {
+        let mut message = wa::Message::default();
+        message.conversation = Some((*body).to_owned());
+        let encrypted = peer
+            .encrypt(
+                &own.to_protocol_address(),
+                &MessageUtils::encode_and_pad(&message),
+            )
+            .await;
+        let enc = enc_payload_from_ciphertext(&encrypted);
+        children.push(
+            NodeBuilder::new("enc")
+                .attr("type", enc.enc_type.as_wire_str())
+                .attr("v", "2")
+                .bytes(enc.ciphertext.to_vec())
+                .build(),
+        );
+    }
+    node_to_arc(
+        NodeBuilder::new("message")
+            .attr("from", &peer.jid)
+            .attr("id", id)
+            .attr("type", "text")
+            .attr("t", wacore::time::now_secs().to_string())
+            .children(children)
+            .build(),
+    )
+}
+
+#[tokio::test]
+async fn multipart_stanza_commits_all_parts_before_one_receipt() {
+    let mut f = Fixture::new("MULTIPART_RECEIVE", false).await;
+    f.stanza = encrypted_parts(
+        &f.client,
+        "12025550125:7@s.whatsapp.net",
+        &f.info.id,
+        &["first part", "second part"],
+    )
+    .await;
+    f.info = f.client.parse_message_info(f.stanza.get()).await.unwrap();
+    f.hook.fail.store(true, Ordering::SeqCst);
+    f.receive().await;
+    assert_eq!(f.hook.attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(f.receipts(), 0);
+    assert!(f.pending().await.is_some());
+    f.hook.fail.store(false, Ordering::SeqCst);
+    f.receive().await;
+    assert_eq!(f.hook.committed.load(Ordering::SeqCst), 2);
+    assert_eq!(f.published(), ["first part", "second part"]);
+    assert_eq!(f.receipts(), 1);
+    assert!(f.pending().await.is_none());
+}
+
+#[tokio::test]
+async fn stalled_hook_does_not_block_an_unrelated_live_chat() {
+    let f = Fixture::new("SLOW_CHAT", false).await;
+    f.hook.pause_first.store(true, Ordering::SeqCst);
+    let task = tokio::spawn(f.client.clone().handle_incoming_message(f.stanza.clone()));
+    f.hook.entered.notified().await;
+    let other = encrypted_parts(
+        &f.client,
+        "12025550126:7@s.whatsapp.net",
+        "OTHER_CHAT",
+        &["independent"],
+    )
+    .await;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        f.client.clone().handle_incoming_message(other),
+    )
+    .await
+    .unwrap();
+    assert_eq!(f.hook.committed.load(Ordering::SeqCst), 1);
+    assert_eq!(f.receipts(), 0, "the stalled stanza is still unconfirmed");
+    assert_eq!(
+        message_texts_for_id(&f.events, "OTHER_CHAT"),
+        ["independent"]
+    );
+    f.hook.release.notify_one();
+    task.await.unwrap();
+    assert_eq!(f.hook.committed.load(Ordering::SeqCst), 2);
 }

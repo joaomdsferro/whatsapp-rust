@@ -55,6 +55,7 @@ impl PendingInboundBatch {
 }
 
 pub(crate) struct InboundCommitBatcher {
+    pub(crate) retention: Arc<retention::InboundRetention>,
     state: std::sync::Mutex<BatchState>,
     #[cfg(test)]
     pub(crate) publication_reached: std::sync::atomic::AtomicBool,
@@ -97,6 +98,7 @@ impl Default for InboundCommitBatcher {
     fn default() -> Self {
         Self {
             state: std::sync::Mutex::new(BatchState::default()),
+            retention: Arc::default(),
             #[cfg(test)]
             publication_reached: std::sync::atomic::AtomicBool::new(false),
             active: std::sync::atomic::AtomicBool::new(true),
@@ -117,6 +119,20 @@ impl InboundCommitBatcher {
             Ok(guard) => guard,
             Err(poison) => poison.into_inner(),
         }
+    }
+
+    pub(crate) fn remove_retained_identity(&self, info: &MessageInfo) {
+        let mut state = self.lock();
+        state.entries.retain(|item| {
+            item.info.id != info.id
+                || item.info.source.chat != info.source.chat
+                || item.info.source.sender != info.source.sender
+        });
+        state.bytes = state
+            .entries
+            .iter()
+            .map(|item| waproto::codec::message_encoded_len(&item.message))
+            .sum();
     }
 
     /// Take the accumulated batch, invalidating any armed timer.
@@ -222,7 +238,19 @@ impl InboundCommitBatcher {
     /// caller must drop the Signal cache with them (their cache-only ratchet
     /// advances have no rows; flushing them later would make each redelivery
     /// an ackable duplicate).
+    #[cfg(test)]
     pub(crate) fn reset(&self) -> bool {
+        self.reset_for_reconnect(false)
+    }
+
+    pub(crate) fn reset_for_reconnect(&self, preserve: bool) -> bool {
+        if preserve {
+            self.epoch.fetch_add(1, Ordering::AcqRel);
+            self.lock().timer_armed = false;
+            self.pending_live.store(false, Ordering::Release);
+            self.active.store(true, Ordering::Release);
+            return false;
+        }
         let dropped = self.take().mark_dropped();
         if !dropped.is_empty() {
             log::debug!(
@@ -296,6 +324,7 @@ impl Drop for ReinsertGuard<'_> {
         // the next enqueue arms a fresh one, and the drain-end/teardown
         // flushes cover the gap regardless.
         state.timer_armed = false;
+        self.batcher.retention.batched(&restored);
         state.entries = restored;
         if let Some(ticket) = self.commit_ticket.take() {
             if state.commit_ticket.is_some() {
@@ -343,12 +372,28 @@ impl Client {
         item: InboundMessage,
         track_commit: bool,
     ) -> InboundCommitState {
+        self.commit_or_batch_inbound_items(Arc::from([item]), track_commit)
+            .await
+    }
+
+    pub(crate) async fn commit_or_batch_inbound_items(
+        self: &Arc<Self>,
+        items: Arc<[InboundMessage]>,
+        track_commit: bool,
+    ) -> InboundCommitState {
+        if let Some(state) = self
+            .inbound_commit_batch
+            .retention
+            .stage(&items, track_commit)
+        {
+            return state;
+        }
         if !self.inbound_commit_batch.is_active() {
             // Arc::from([item]) builds the event/hook slice in one allocation;
             // a Vec would add an alloc+dealloc per live message (measured
             // ~18ns and 2x the allocations of this step).
             return if self
-                .commit_inbound_batch(Arc::from([item]), BatchOrigin::Live, None)
+                .commit_inbound_batch(items, BatchOrigin::Live, None)
                 .await
             {
                 InboundCommitState::Durable
@@ -356,7 +401,14 @@ impl Client {
                 InboundCommitState::Failed
             };
         }
-        let (timer_epoch, ticket) = self.enqueue_inbound_commit(item, track_commit);
+        self.inbound_commit_batch.retention.batched(&items);
+        let mut timer_epoch = None;
+        let mut ticket = None;
+        for item in items.iter().cloned() {
+            let (epoch, item_ticket) = self.enqueue_inbound_commit(item, track_commit);
+            timer_epoch = timer_epoch.or(epoch);
+            ticket = ticket.or(item_ticket);
+        }
         if let Some(epoch) = timer_epoch {
             // Weak: a sleeper must not keep the whole Client graph alive for
             // up to 3s after the app drops its handle.
@@ -576,6 +628,12 @@ impl Client {
         self: &Arc<Self>,
         limit: std::time::Duration,
     ) -> DrainOutcome {
+        if self.inbound_durability_hook().is_some() {
+            // A socket reset cannot roll back Signal state shared with outgoing
+            // sends or discard plaintext admitted by another live worker. Keep
+            // both across this bounded attempt; recovery owns the retained data.
+            return self.flush_inbound_commits_bounded(limit).await;
+        }
         let settle = async {
             let _permit = self.acquire_message_processing_permit().await;
             let batch = self.inbound_commit_batch.take();
@@ -900,6 +958,9 @@ impl Client {
             items: is_drain.then(|| Arc::clone(&items)),
             commit_ticket,
         };
+        let Some(mut retained) = self.inbound_commit_batch.retention.commit(&items) else {
+            return false;
+        };
         #[cfg(test)]
         if self
             .inbound_commit_batch
@@ -970,22 +1031,88 @@ impl Client {
                         );
                     }
                 }
-                let rows: Vec<PendingInboundRow<'_>> = items
+                // A stanza can carry several distinct payloads under one key.
+                // Keep their order and multiplicity in one opaque record rather
+                // than letting the backend's replace-into retain only the tail.
+                let mut groups: Vec<Vec<usize>> = Vec::new();
+                let mut indexes = std::collections::HashMap::new();
+                for (i, (item, (chat, sender))) in items.iter().zip(&keys).enumerate() {
+                    let index =
+                        *indexes
+                            .entry((chat, sender, &item.info.id))
+                            .or_insert_with(|| {
+                                groups.push(Vec::new());
+                                groups.len() - 1
+                            });
+                    groups[index].push(i);
+                }
+                let records: Vec<Option<Vec<u8>>> = groups
                     .iter()
-                    .zip(&keys)
-                    .zip(&ranges)
-                    .map(|((item, (chat, sender)), range)| PendingInboundRow {
-                        chat,
-                        sender,
-                        id: &item.info.id,
-                        message: &arena[range.clone()],
+                    .map(|group| {
+                        (group.len() > 1).then(|| {
+                            let parts: Vec<&[u8]> =
+                                group.iter().map(|&i| &arena[ranges[i].clone()]).collect();
+                            durability::encode_pending_parts(&parts)
+                        })
+                    })
+                    .collect();
+                let rows: Vec<PendingInboundRow<'_>> = groups
+                    .iter()
+                    .zip(&records)
+                    .map(|(group, record)| {
+                        let i = group[0];
+                        PendingInboundRow {
+                            chat: &keys[i].0,
+                            sender: &keys[i].1,
+                            id: &items[i].info.id,
+                            message: record.as_deref().unwrap_or(&arena[ranges[i].clone()]),
+                        }
                     })
                     .collect();
 
                 // Fail closed: without a durable buffered copy, do not run the
                 // hook and do not ack — the entries return to the batcher (via
                 // the guard) and the server redelivers once storage recovers.
-                if let Err(e) = backend.store_pending_inbound_batch(&rows).await {
+                let mut updates = Vec::with_capacity(rows.len());
+                for row in &rows {
+                    match backend
+                        .get_pending_inbound(row.chat, row.sender, row.id)
+                        .await
+                    {
+                        Ok(None) => updates.push((true, None)),
+                        Ok(Some(existing)) => {
+                            match durability::extend_pending_record(&existing, row.message) {
+                                Ok(Some(extended)) => updates.push((true, Some(extended))),
+                                Ok(None) => updates.push((false, None)),
+                                Err(error) => {
+                                    log::error!(
+                                        "Pending inbound record is corrupt or conflicts with retained parts; preserving both copies and withholding receipt: {error:?}"
+                                    );
+                                    return false;
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            log::warn!(
+                                "Cannot check pending inbound record; withholding receipt: {error:?}"
+                            );
+                            return false;
+                        }
+                    }
+                }
+                let missing: Vec<_> = rows
+                    .into_iter()
+                    .zip(&updates)
+                    .filter_map(|(row, (write, bytes))| {
+                        write.then(|| PendingInboundRow {
+                            message: bytes.as_deref().unwrap_or(row.message),
+                            ..row
+                        })
+                    })
+                    .collect();
+                if !missing.is_empty()
+                    && let Err(e) = backend.store_pending_inbound_batch(&missing).await
+                {
                     log::error!(
                         "Failed to buffer inbound batch of {}; suppressing acks for redelivery: {e:?}",
                         items.len()
@@ -1006,6 +1133,7 @@ impl Client {
             // future must not restore the entries — redelivery replays from
             // the rows.
             reinsert.mark_durable();
+            retained.durable();
 
             if let Err(e) = hook.on_messages(self.clone(), &items).await {
                 log::warn!(
@@ -1070,6 +1198,7 @@ impl Client {
         }
 
         reinsert.mark_durable();
+        retained.complete();
         #[cfg(test)]
         self.inbound_commit_batch
             .publication_reached
@@ -1107,8 +1236,15 @@ impl Client {
         }
         let items = retained.map(Arc::from).unwrap_or(items);
         // Schedule receipts before synchronous consumer code can block or panic.
+        let mut receipted = std::collections::HashSet::new();
         for item in arrived.iter() {
-            self.ack_received_message(&item.info);
+            if receipted.insert((
+                &item.info.source.chat,
+                &item.info.source.sender,
+                &item.info.id,
+            )) {
+                self.ack_received_message(&item.info);
+            }
         }
         if is_drain {
             self.flush_offline_receipts();
