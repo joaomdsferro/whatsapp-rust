@@ -51,7 +51,10 @@ pub fn recognize_tag(value: &str) -> bool {
 
 #[test]
 fn expansion_preserves_unknown_values_and_generated_tag_dispatch() {
-    let node = Attributes { value: "synthetic".into() }.into_node();
+    let node = Attributes {
+        value: "synthetic".into(),
+    }
+    .into_node();
     assert_eq!(parse_attributes(&node).unwrap().value, "synthetic");
     assert_eq!(Empty.into_node().tag, "synthetic-empty");
     let text: TextCode = serde_json::from_str("\"future-code\"").unwrap();
@@ -62,5 +65,8 @@ fn expansion_preserves_unknown_values_and_generated_tag_dispatch() {
     assert_eq!(serde_json::to_string(&number).unwrap(), "987654");
     assert!(recognize_tag("known"));
     assert!(!recognize_tag("future-code"));
-    assert_eq!(serialize_payload("synthetic".into()), serde_json::json!({"kind":"known","value":"synthetic"}));
+    assert_eq!(
+        serialize_payload("synthetic".into()),
+        serde_json::json!({"kind":"known","value":"synthetic"})
+    );
 }
