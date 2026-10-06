@@ -2171,12 +2171,14 @@ mod tests {
             let NewsletterError::Iq(IqError::ParseError(parse)) = &error else {
                 panic!("expected IQ parse error, got {error:?}");
             };
-            assert_eq!(
-                parse.root_cause().to_string(),
-                "<my_addons> child not found"
-            );
-            assert!(error.source().unwrap().is::<IqError>());
-            assert!(error.source().unwrap().source().is_some());
+            let iq_source = error
+                .source()
+                .expect("IQ cause")
+                .downcast_ref::<IqError>()
+                .expect("typed IQ cause");
+            let parser_source = iq_source.source().expect("parser cause");
+            let stored_parser: &(dyn Error + 'static) = parse.as_ref();
+            assert!(std::ptr::addr_eq(parser_source, stored_parser));
             assert_eq!(error.server_rejection(), None);
             assert_eq!(error.http_status(), None);
             assert!(!error.is_timeout());
