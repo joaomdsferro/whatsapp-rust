@@ -6,7 +6,23 @@
 #![allow(clippy::all)]
 
 /// A syncd collection (mutation bucket / priority).
+///
+/// Consumers must allow new catalog variants.
+///
+/// ```compile_fail,E0004
+/// use wacore_appstate::schemas::Collection;
+/// fn exhaustive(value: Collection) {
+///     match value {
+///         Collection::Regular => (),
+///         Collection::RegularLow => (),
+///         Collection::RegularHigh => (),
+///         Collection::CriticalBlock => (),
+///         Collection::CriticalUnblockLow => (),
+///     }
+/// }
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Collection {
     Regular,
     RegularLow,
@@ -28,7 +44,23 @@ impl Collection {
 }
 
 /// The index scope an action applies to.
+///
+/// Consumers must allow new catalog variants.
+///
+/// ```compile_fail,E0004
+/// use wacore_appstate::schemas::Scope;
+/// fn exhaustive(value: Scope) {
+///     match value {
+///         Scope::Account => (),
+///         Scope::Chat => (),
+///         Scope::ChatMessageRange => (),
+///         Scope::ChatOrContact => (),
+///         Scope::Message => (),
+///     }
+/// }
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Scope {
     Account,
     Chat,
@@ -50,7 +82,22 @@ impl Scope {
 }
 
 /// One component of a mutation index key.
+///
+/// Consumers must allow new index-part variants.
+///
+/// ```compile_fail,E0004
+/// use wacore_appstate::schemas::IndexPart;
+/// fn exhaustive(part: IndexPart) {
+///     match part {
+///         IndexPart::Literal { .. } | IndexPart::Jid { .. }
+///         | IndexPart::BoolString { .. } | IndexPart::JidOrZero { .. }
+///         | IndexPart::Enum { .. } | IndexPart::StringPart { .. }
+///         | IndexPart::Unknown { .. } => (),
+///     }
+/// }
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum IndexPart {
     /// Fixed wire name at position 0.
     Literal { value: &'static str },
@@ -72,7 +119,15 @@ pub enum IndexPart {
 }
 
 /// A syncd action schema.
+///
+/// Use [`Schema::new`] or copy a registry entry, leaving room for new metadata.
+///
+/// ```compile_fail,E0639
+/// use wacore_appstate::schemas::{Schema, ALL};
+/// let schema = Schema { ..ALL[0] };
+/// ```
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct Schema {
     /// Registry key (e.g. "Agent").
     pub key: &'static str,
@@ -92,6 +147,48 @@ pub struct Schema {
     /// Index position holding the chat JID, if any.
     pub chat_jid_index: Option<i64>,
     pub index_parts: &'static [IndexPart],
+}
+
+impl Schema {
+    /// Construct a schema with no optional metadata.
+    ///
+    /// Public fields remain readable and writable for host-defined actions.
+    ///
+    /// ```
+    /// use wacore_appstate::schemas::{Collection, IndexPart, Schema, Scope};
+    /// const CUSTOM: Schema = Schema::new(
+    ///     "Custom", "custom", "Host", Collection::Regular, 1, Scope::Account,
+    ///     &[IndexPart::Literal { value: "custom" }],
+    /// );
+    /// let mut action = CUSTOM;
+    /// action.value_field = Some("customAction");
+    /// let Schema { name, value_field, .. } = action;
+    /// assert_eq!(name, "custom");
+    /// assert_eq!(value_field, Some("customAction"));
+    /// ```
+    pub const fn new(
+        key: &'static str,
+        name: &'static str,
+        module: &'static str,
+        collection: Collection,
+        version: u32,
+        scope: Scope,
+        index_parts: &'static [IndexPart],
+    ) -> Self {
+        Self {
+            key,
+            name,
+            module,
+            collection,
+            version,
+            scope,
+            value_field: None,
+            value_proto_type: None,
+            value_enum_fields: &[],
+            chat_jid_index: None,
+            index_parts,
+        }
+    }
 }
 
 /// All syncd collections, in dependency order.
