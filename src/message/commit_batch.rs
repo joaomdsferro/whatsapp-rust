@@ -299,7 +299,7 @@ struct ReinsertGuard<'a> {
     commit_ticket: Option<InboundCommitTicket>,
     // Fields drop after our Drop implementation: restore the batch before
     // waking a producer that was waiting for this identity's commit.
-    retained: Option<super::retention::RetentionCommit>,
+    retained: Option<retention::RetentionCommit>,
 }
 
 impl ReinsertGuard<'_> {
