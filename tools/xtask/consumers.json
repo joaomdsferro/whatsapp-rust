@@ -4,6 +4,12 @@
     "locked": true,
     "commands": [
       {
+        "lanes": ["native", "msrv"],
+        "mode": "test",
+        "features": ["event-fixtures"],
+        "test": "event_delivery"
+      },
+      {
         "lanes": ["wasm"],
         "mode": "test",
         "features": ["wasm-execution"],

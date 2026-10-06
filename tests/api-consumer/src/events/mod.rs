@@ -15,10 +15,6 @@
 //! }
 //! ```
 
-#[cfg(all(test, feature = "native"))]
-#[path = "../../../event_delivery_public.rs"]
-mod contracts;
-
 /// Incoming values can be sent back without translating between SDK/core enums.
 /// The caller decides whether relaying a remote contact's state is appropriate.
 pub async fn relay_presence_and_activity(
