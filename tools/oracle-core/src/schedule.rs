@@ -4,6 +4,7 @@
 //! concurrently, so scheduling is not a mutual exclusion or memory-safety contract.
 //! Shutdown disables scheduling and wakes blocked acquisitions before joining workers.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -42,6 +43,8 @@ pub struct Scheduler {
 struct State {
     /// The thread holding the turn, if any.
     holder: Option<u64>,
+    /// Arrival order prevents a yielding poller from overtaking sleeping waiters.
+    queue: VecDeque<u64>,
 }
 
 impl Scheduler {
@@ -77,9 +80,9 @@ impl Scheduler {
 
     /// How often a thread had to take its turn without being granted one.
     ///
-    /// Non-zero means guest code was waiting on something it never signalled
-    /// through a host call, and the serialisation guarantee was broken to keep
-    /// going.
+    /// Non-zero means a waiter exhausted its deadline and ran before the
+    /// holder released its turn. Guest waits and host scheduling delays can
+    /// both cause this; turns do not guarantee mutual exclusion.
     pub fn forced_turns(&self) -> u64 {
         self.forced.load(Ordering::SeqCst)
     }
@@ -96,13 +99,14 @@ impl Scheduler {
             } else {
                 TURN_TIMEOUT
             };
-        self.waiting.fetch_add(1, Ordering::SeqCst);
-
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        while let Some(holder) = state.holder {
-            if holder == thread {
-                break;
-            }
+        if state.holder == Some(thread) {
+            return;
+        }
+        state.queue.push_back(thread);
+        self.waiting.fetch_add(1, Ordering::SeqCst);
+        while self.is_enabled() && (state.holder.is_some() || state.queue.front() != Some(&thread))
+        {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 self.forced.fetch_add(1, Ordering::SeqCst);
@@ -114,10 +118,14 @@ impl Scheduler {
                 .unwrap_or_else(|e| e.into_inner());
             state = next;
         }
+        // A timed-out waiter can leave from the middle; shutdown also drains
+        // each caller's entry before it returns to the host.
+        if let Some(index) = state.queue.iter().position(|queued| *queued == thread) {
+            state.queue.remove(index);
+        }
         if self.is_enabled() {
             state.holder = Some(thread);
         }
-
         self.waiting.fetch_sub(1, Ordering::SeqCst);
     }
 
@@ -180,6 +188,52 @@ impl Drop for Turn<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_released_turn_cannot_overtake_an_existing_waiter() {
+        use std::sync::Arc;
+
+        let scheduler = Arc::new(Scheduler::default());
+        scheduler.enable();
+        scheduler.acquire(0);
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let waiting_scheduler = Arc::clone(&scheduler);
+        let waiting_order = Arc::clone(&order);
+        let waiter = std::thread::spawn(move || {
+            let _turn = waiting_scheduler.turn(1);
+            waiting_order.lock().unwrap().push(1);
+        });
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while scheduler.waiting.load(Ordering::SeqCst) != 1 {
+            assert!(Instant::now() < deadline, "waiter did not enter scheduler");
+            std::thread::yield_now();
+        }
+        // Model a released turn before the sleeping waiter receives its wakeup.
+        // A new arrival must not take that turn while the first waiter sleeps.
+        scheduler.state.lock().unwrap().holder = None;
+        let waking_scheduler = Arc::clone(&scheduler);
+        let observed_order = Arc::clone(&order);
+        let wakeup = std::thread::spawn(move || {
+            while waking_scheduler.waiting.load(Ordering::SeqCst) != 2
+                && observed_order.lock().unwrap().is_empty()
+            {
+                assert!(
+                    Instant::now() < deadline,
+                    "second acquisition never arrived"
+                );
+                std::thread::yield_now();
+            }
+            waking_scheduler.turn_available.notify_all();
+        });
+        {
+            let _turn = scheduler.turn(0);
+            order.lock().unwrap().push(0);
+        }
+        wakeup.join().unwrap();
+        waiter.join().unwrap();
+        assert_eq!(*order.lock().unwrap(), [1, 0]);
+        assert_eq!(scheduler.forced_turns(), 0);
+    }
 
     #[test]
     fn clock_import_yields_to_a_waiting_thread() {
