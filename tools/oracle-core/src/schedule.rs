@@ -181,6 +181,90 @@ impl Drop for Turn<'_> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn clock_import_yields_to_a_waiting_thread() {
+        use std::sync::Arc;
+        use wasm_encoder::{
+            BlockType, CodeSection, EntityType, ExportKind, ExportSection, Function,
+            FunctionSection, ImportSection, Instruction, MemArg, MemoryType, Module, TypeSection,
+            ValType,
+        };
+
+        let mut types = TypeSection::new();
+        types.ty().function([], [ValType::F64]);
+        types.ty().function([], []);
+        let mut imports = ImportSection::new();
+        imports.import("env", "emscripten_get_now", EntityType::Function(0));
+        imports.import(
+            "env",
+            "memory",
+            EntityType::Memory(MemoryType {
+                minimum: 1,
+                maximum: Some(1),
+                memory64: false,
+                shared: true,
+                page_size_log2: None,
+            }),
+        );
+        let mut functions = FunctionSection::new();
+        functions.function(1);
+        let mut exports = ExportSection::new();
+        exports.export("poll", ExportKind::Func, 1);
+        let mut function = Function::new([]);
+        // The waiting thread publishes one byte only after obtaining its turn.
+        // A clock-only guest loop must let it progress before the timeout escape.
+        for instruction in [
+            Instruction::Loop(BlockType::Empty),
+            Instruction::Call(0),
+            Instruction::Drop,
+            Instruction::I32Const(0),
+            Instruction::I32AtomicLoad8U(MemArg {
+                offset: 0,
+                align: 0,
+                memory_index: 0,
+            }),
+            Instruction::I32Eqz,
+            Instruction::BrIf(0),
+            Instruction::End,
+            Instruction::End,
+        ] {
+            function.instruction(&instruction);
+        }
+        let mut code = CodeSection::new();
+        code.function(&function);
+        let mut module = Module::new();
+        module
+            .section(&types)
+            .section(&imports)
+            .section(&functions)
+            .section(&exports)
+            .section(&code);
+        let mut runtime = crate::Runtime::instantiate(&module.finish()).unwrap();
+        let shared = Arc::clone(runtime.shared());
+        shared.scheduler.enable();
+        shared.scheduler.acquire(0);
+        let memory = runtime.state().memory.clone();
+        let waiter_shared = Arc::clone(&shared);
+        let waiter = std::thread::spawn(move || {
+            let _turn = waiter_shared.scheduler.turn(7);
+            let mut state = crate::state::HostState::default();
+            state.memory = memory;
+            state.write(0, &[1]).unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while shared.scheduler.waiting.load(Ordering::SeqCst) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "waiter did not reach the scheduler"
+            );
+            std::thread::yield_now();
+        }
+        let outcome = runtime.call("poll", &[]);
+        waiter.join().unwrap();
+        outcome.unwrap();
+        assert_eq!(shared.scheduler.forced_turns(), 0);
+    }
+
     /// The failure the guard exists for: a worker that returns early while
     /// holding the turn stays the recorded holder, and every later acquisition
     /// then waits out `TURN_TIMEOUT` and forces its way through — one failed
