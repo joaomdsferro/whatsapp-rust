@@ -3584,8 +3584,34 @@ impl Client {
                     target: "Client/AppState",
                     "Failed to apply the snapshot recovery for {name}: {e}"
                 );
+                if let Some(client) = self.self_weak.get().and_then(|w| w.upgrade()) {
+                    client.fall_back_to_unverified_snapshot(name);
+                }
             }
         }
+    }
+
+    /// Peer recovery failed for a collection whose snapshot does not validate:
+    /// take the server's snapshot after all, with each record still checked on
+    /// its own, rather than leave the collection empty for good.
+    pub(crate) fn fall_back_to_unverified_snapshot(self: &Arc<Self>, name: &str) {
+        let Ok(patch) = name.parse::<WAPatchName>() else {
+            return;
+        };
+        if patch == WAPatchName::CriticalBlock {
+            return;
+        }
+        warn!(
+            target: "Client/AppState",
+            "Falling back to the server's {name} snapshot without its aggregate MAC"
+        );
+        wacore::appstate::tolerate_snapshot_mac_mismatch(name);
+        let client = self.clone();
+        self.runtime.spawn_detached(Box::pin(async move {
+            if let Err(e) = client.resync_app_state_collection(patch).await {
+                warn!(target: "Client/AppState", "Fallback resync of {patch:?} failed: {e}");
+            }
+        }));
     }
 
     /// Ask the primary for a collection whose snapshot this side cannot validate.

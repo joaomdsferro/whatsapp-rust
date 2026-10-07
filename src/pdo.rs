@@ -1063,60 +1063,25 @@ impl Client {
             // way.
             let decoded = wacore::runtime::blocking(&*client.runtime, move || {
                 let bytes = if compressed {
-                    let mut reader = wacore_binary::zlib_pool::InflateReader::new(
-                        &payload,
-                        wacore::history_sync::MAX_DECOMPRESSED,
-                    );
-                    let mut plain = Vec::new();
-                    loop {
-                        match reader.ensure(1) {
-                            Ok(true) => {}
-                            // `ensure(1)` answers false only with nothing left.
-                            Ok(false) => break,
-                            Err(e) => return Err(format!("failed to decompress: {e}")),
-                        }
-                        let taken = {
-                            let chunk = reader.available();
-                            plain.extend_from_slice(chunk);
-                            chunk.len()
-                        };
-                        if taken == 0 {
-                            break;
-                        }
-                        reader.consume(taken);
+                    match inflate_zlib(&payload) {
+                        Ok(plain) => std::borrow::Cow::Owned(plain),
+                        Err(zlib) => match inflate_other(&payload) {
+                            Some(plain) => std::borrow::Cow::Owned(plain),
+                            None => {
+                                return Err(format!(
+                                    "{zlib} (header {:02x?}, not gzip or raw deflate either)",
+                                    &payload[..payload.len().min(4)]
+                                ));
+                            }
+                        },
                     }
-                    // Running out is not ending. A payload cut short after a
-                    // parseable prefix would otherwise be applied as the whole
-                    // collection, and a short collection cannot be told from a
-                    // real one -- nothing here knows how many records to expect.
-                    if !reader.stream_ended() {
-                        return Err("is a truncated compressed stream".to_string());
-                    }
-                    // And ending is not all of it. A complete stream followed by
-                    // a second member or by trailing bytes leaves the reader
-                    // done with input to spare, and taking the first member for
-                    // the collection is the same silent short read the check
-                    // above refuses -- reached from the other direction.
-                    let (read, whole) = reader.compressed_progress();
-                    if read != whole {
-                        return Err(format!(
-                            "carries {} byte(s) after its compressed stream",
-                            whole - read
-                        ));
-                    }
-                    std::borrow::Cow::Owned(plain)
                 } else {
-                    // Already bounded: the raw blob was measured against the
-                    // same ceiling before it was copied, which is what an
-                    // uncompressed reply needs -- the decode allocates a record
-                    // graph from whatever arrives.
                     std::borrow::Cow::Borrowed(&payload[..])
                 };
                 waproto::codec::syncd_snapshot_recovery_decode(&bytes)
                     .map_err(|e| format!("failed to decode: {e}"))
             })
             .await;
-
             let recovery = match decoded {
                 Ok(recovery) => recovery,
                 Err(e) => {
@@ -1127,9 +1092,10 @@ impl Client {
                     // the rest of the window over a question already answered.
                     let proc = client.get_app_state_processor();
                     match proc.take_recovery_request_by_id(&request_id).await {
-                        Some(name) => warn!(
-                            "Snapshot recovery response for {name} {e}; the collection may be asked for again"
-                        ),
+                        Some(name) => {
+                            warn!("Snapshot recovery response for {name} {e}");
+                            client.fall_back_to_unverified_snapshot(&name);
+                        }
                         None => warn!("Snapshot recovery response {e}"),
                     }
                     return;
@@ -1154,7 +1120,10 @@ impl Client {
             // registry wholesale -- so a task that started before one and
             // applied after it would write beside the new connection's own sync
             // and dispatch events for a session that has since been replaced.
-            if client.connection_generation.load(std::sync::atomic::Ordering::Acquire) != generation
+            if client
+                .connection_generation
+                .load(std::sync::atomic::Ordering::Acquire)
+                != generation
             {
                 // Spent, like every other ending that is not an apply. The ask
                 // was answered; dropping the answer because the connection went
@@ -3806,4 +3775,65 @@ mod tests {
             "memo must survive a content-less response"
         );
     }
+}
+
+/// Inflates a zlib stream, refusing one that is cut short or followed by more
+/// bytes.
+fn inflate_zlib(payload: &[u8]) -> Result<Vec<u8>, String> {
+    let mut reader = wacore_binary::zlib_pool::InflateReader::new(
+        &payload,
+        wacore::history_sync::MAX_DECOMPRESSED,
+    );
+    let mut plain = Vec::new();
+    loop {
+        match reader.ensure(1) {
+            Ok(true) => {}
+            // `ensure(1)` answers false only with nothing left.
+            Ok(false) => break,
+            Err(e) => return Err(format!("failed to decompress: {e}")),
+        }
+        let taken = {
+            let chunk = reader.available();
+            plain.extend_from_slice(chunk);
+            chunk.len()
+        };
+        if taken == 0 {
+            break;
+        }
+        reader.consume(taken);
+    }
+    // Running out is not ending. A payload cut short after a
+    // parseable prefix would otherwise be applied as the whole
+    // collection, and a short collection cannot be told from a
+    // real one -- nothing here knows how many records to expect.
+    if !reader.stream_ended() {
+        return Err("is a truncated compressed stream".to_string());
+    }
+    // And ending is not all of it. A complete stream followed by
+    // a second member or by trailing bytes leaves the reader
+    // done with input to spare, and taking the first member for
+    // the collection is the same silent short read the check
+    // above refuses -- reached from the other direction.
+    let (read, whole) = reader.compressed_progress();
+    if read != whole {
+        return Err(format!(
+            "carries {} byte(s) after its compressed stream",
+            whole - read
+        ));
+    }
+    Ok(plain)
+}
+
+/// The primary's reply flagged compressed but not as zlib: try gzip, then raw
+/// deflate. Bounded like the zlib path.
+fn inflate_other(payload: &[u8]) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let max = wacore::history_sync::MAX_DECOMPRESSED;
+    let read = |reader: &mut dyn Read| -> Option<Vec<u8>> {
+        let mut plain = Vec::new();
+        reader.take(max + 1).read_to_end(&mut plain).ok()?;
+        (!plain.is_empty() && plain.len() as u64 <= max).then_some(plain)
+    };
+    read(&mut flate2::read::GzDecoder::new(payload))
+        .or_else(|| read(&mut flate2::read::DeflateDecoder::new(payload)))
 }
