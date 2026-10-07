@@ -1830,8 +1830,10 @@ mod tests {
         hook.release.add_permits(1);
         let invalid = vec![0xff];
         for _ in 0..2 {
-            let mut notification = HistorySyncNotification::default();
-            notification.initial_hist_bootstrap_inline_payload = Some(invalid.clone());
+            let notification = HistorySyncNotification {
+                initial_hist_bootstrap_inline_payload: Some(invalid.clone()),
+                ..Default::default()
+            };
             client
                 .process_history_sync_task("HIST_UNVALIDATED".to_owned(), notification.into())
                 .await;
