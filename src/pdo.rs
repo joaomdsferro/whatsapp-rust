@@ -2162,6 +2162,15 @@ fn inflate_other(payload: &[u8]) -> Option<Vec<u8>> {
         reader.take(max + 1).read_to_end(&mut plain).ok()?;
         (!plain.is_empty() && plain.len() as u64 <= max).then_some(plain)
     };
-    read(&mut flate2::read::GzDecoder::new(payload))
-        .or_else(|| read(&mut flate2::read::DeflateDecoder::new(payload)))
+    let (format, plain) = read(&mut flate2::read::GzDecoder::new(payload))
+        .map(|plain| ("gzip", plain))
+        .or_else(|| {
+            read(&mut flate2::read::DeflateDecoder::new(payload))
+                .map(|plain| ("raw deflate", plain))
+        })?;
+    info!(
+        "Snapshot recovery payload is {format}, not zlib (header {:02x?})",
+        &payload[..payload.len().min(4)]
+    );
+    Some(plain)
 }
