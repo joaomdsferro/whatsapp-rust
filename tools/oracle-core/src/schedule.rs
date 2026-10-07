@@ -5,7 +5,7 @@
 //! Shutdown disables scheduling and wakes blocked acquisitions before joining workers.
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Condvar, Mutex};
+use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// How long a thread waits for its turn before taking it anyway.
@@ -42,9 +42,45 @@ pub struct Scheduler {
 struct State {
     /// The thread holding the turn, if any.
     holder: Option<u64>,
+    /// Host operation active on the main runtime; not the holder's guest PC.
+    diagnostic_phase: &'static str,
+}
+
+fn diagnostics_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("WA_ORACLE_TURN_DIAGNOSTICS").is_some())
+}
+
+/// Restores the main-runtime operation even if it traps or returns early.
+pub(crate) struct DiagnosticPhase<'a> {
+    scheduler: &'a Scheduler,
+    previous: &'static str,
+}
+
+impl Drop for DiagnosticPhase<'_> {
+    fn drop(&mut self) {
+        self.scheduler
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .diagnostic_phase = self.previous;
+    }
 }
 
 impl Scheduler {
+    pub(crate) fn diagnostic_phase(&self, phase: &'static str) -> Option<DiagnosticPhase<'_>> {
+        diagnostics_enabled().then(|| self.set_diagnostic_phase(phase))
+    }
+
+    fn set_diagnostic_phase(&self, phase: &'static str) -> DiagnosticPhase<'_> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::mem::replace(&mut state.diagnostic_phase, phase);
+        DiagnosticPhase {
+            scheduler: self,
+            previous,
+        }
+    }
+
     /// Turns scheduling on. Off by default: a single-threaded module pays
     /// nothing, and the cost only makes sense once threads actually run.
     pub fn enable(&self) {
@@ -90,7 +126,8 @@ impl Scheduler {
             return;
         }
 
-        let deadline = Instant::now()
+        let started = Instant::now();
+        let deadline = started
             + if self.is_strict() {
                 STRICT_TIMEOUT
             } else {
@@ -98,6 +135,7 @@ impl Scheduler {
             };
         self.waiting.fetch_add(1, Ordering::SeqCst);
 
+        let mut timeout = None;
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         while let Some(holder) = state.holder {
             if holder == thread {
@@ -105,7 +143,16 @@ impl Scheduler {
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                self.forced.fetch_add(1, Ordering::SeqCst);
+                let ordinal = self.forced.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
+                if diagnostics_enabled() {
+                    timeout = Some((
+                        ordinal,
+                        holder,
+                        state.diagnostic_phase,
+                        self.waiting.load(Ordering::SeqCst),
+                        started.elapsed(),
+                    ));
+                }
                 break;
             }
             let (next, _) = self
@@ -119,6 +166,16 @@ impl Scheduler {
         }
 
         self.waiting.fetch_sub(1, Ordering::SeqCst);
+        drop(state);
+        // Logging is opt-in and outside the scheduler lock. It can still change
+        // timing, so a passing diagnostic run cannot qualify the original CI run.
+        if let Some((ordinal, holder, phase, waiting, elapsed)) = timeout {
+            eprintln!(
+                "oracle-turn-timeout forced={ordinal} holder={holder} requester={thread} main_phase={phase:?} waiting={waiting} elapsed_ms={} strict={}",
+                elapsed.as_millis(),
+                self.is_strict()
+            );
+        }
     }
 
     /// Takes a turn for `thread` and gives it back when the guard is dropped.
@@ -180,6 +237,25 @@ impl Drop for Turn<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diagnostic_phase_restores_after_nested_error() {
+        let scheduler = Scheduler::default();
+        let outer = scheduler.set_diagnostic_phase("ctors");
+        let fail = || -> Result<(), ()> {
+            let _inner = scheduler.set_diagnostic_phase("initVoipStack");
+            assert_eq!(
+                scheduler.state.lock().unwrap().diagnostic_phase,
+                "initVoipStack"
+            );
+            Err(())
+        };
+        assert!(fail().is_err());
+        assert_eq!(scheduler.state.lock().unwrap().diagnostic_phase, "ctors");
+        drop(outer);
+        assert_eq!(scheduler.state.lock().unwrap().diagnostic_phase, "");
+        assert_eq!(scheduler.forced_turns(), 0);
+    }
 
     /// The failure the guard exists for: a worker that returns early while
     /// holding the turn stays the recorded holder, and every later acquisition

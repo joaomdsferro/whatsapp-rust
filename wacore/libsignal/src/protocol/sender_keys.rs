@@ -5,7 +5,8 @@
 
 use std::collections::VecDeque;
 
-use buffa::MessageField;
+use super::local_field::{future_record_fields, unknown_fields_retained};
+use buffa::{Message as _, MessageField};
 
 use hmac::{Hmac, HmacReset, KeyInit, Mac};
 use sha2::Sha256;
@@ -119,9 +120,11 @@ impl StoredMessageKey {
         let seeds = seeds.freeze();
         keys.iter()
             .enumerate()
-            .map(|(i, key)| sender_key_state_structure::SenderMessageKey {
-                iteration: Some(key.iteration),
-                seed: Some(seeds.slice(i * 32..(i + 1) * 32)),
+            .map(|(i, key)| {
+                let mut proto = sender_key_state_structure::SenderMessageKey::default();
+                proto.iteration = Some(key.iteration);
+                proto.seed = Some(seeds.slice(i * 32..(i + 1) * 32));
+                proto
             })
             .collect()
     }
@@ -234,15 +237,20 @@ impl SenderChainKey {
 
     pub(crate) fn as_protobuf(&self) -> sender_key_state_structure::SenderChainKey {
         use bytes::Bytes;
-        sender_key_state_structure::SenderChainKey {
-            iteration: Some(self.iteration),
-            seed: Some(Bytes::copy_from_slice(&self.chain_key)),
+        {
+            let mut proto = sender_key_state_structure::SenderChainKey::default();
+            proto.iteration = Some(self.iteration);
+            proto.seed = Some(Bytes::copy_from_slice(&self.chain_key));
+            proto
         }
     }
 }
 
 #[derive(Clone)]
 pub struct SenderKeyState {
+    // Only records carrying future fields retain a protobuf template. The
+    // common compact representation and its copy-on-write backlog stay intact.
+    future: Option<std::sync::Arc<SenderKeyStateStructure>>,
     /// The state's identity on the wire. `None` only for a structurally
     /// invalid state decoded from a record missing field 1; it round-trips
     /// back as absent so the persisted encoding stays byte-identical.
@@ -251,7 +259,9 @@ pub struct SenderKeyState {
     /// every use; the other two protobuf fields (`sender_chain_key`,
     /// `sender_message_keys`) live only in the typed fields below and are
     /// reassembled into a fresh structure at serialization.
-    sender_signing_key: MessageField<sender_key_state_structure::SenderSigningKey>,
+    // Immutable across chain advances. Share the protobuf header as well as its
+    // Bytes so loading a cached record does not allocate another signing key.
+    sender_signing_key: Option<std::sync::Arc<sender_key_state_structure::SenderSigningKey>>,
     /// The cached out-of-order message keys, held behind an `Arc` so cloning the
     /// state (and thus the whole `SenderKeyRecord` on every group load) is a
     /// refcount bump instead of a deep copy of up to `MAX_MESSAGE_KEYS` keys.
@@ -322,12 +332,14 @@ impl SenderKeyState {
             .try_into()
             .map_err(|_| SignalProtocolError::InvalidProtobufEncoding)?;
         let sender_chain = Some(SenderChainKey::new(iteration, chain_key_arr));
-        let sender_signing_key = MessageField::some(sender_key_state_structure::SenderSigningKey {
-            public: Some(Bytes::copy_from_slice(&signature_key.serialize())),
-            private: signature_private_key
+        let sender_signing_key = Some(std::sync::Arc::new({
+            let mut proto = sender_key_state_structure::SenderSigningKey::default();
+            proto.public = Some(Bytes::copy_from_slice(&signature_key.serialize()));
+            proto.private = signature_private_key
                 .as_ref()
-                .map(|k| Bytes::copy_from_slice(k.serialize().as_ref())),
-        });
+                .map(|k| Bytes::copy_from_slice(k.serialize().as_ref()));
+            proto
+        }));
 
         let signing_key_memo = std::sync::OnceLock::new();
         if let Some(key) = signature_private_key {
@@ -344,6 +356,7 @@ impl SenderKeyState {
             let _ = verifying_key_memo.set(verifier);
         }
         Ok(Self {
+            future: None,
             sender_key_id: Some(chain_id),
             sender_signing_key,
             message_keys: std::sync::Arc::new(Vec::new()),
@@ -354,6 +367,21 @@ impl SenderKeyState {
     }
 
     pub(crate) fn from_protobuf(mut state: SenderKeyStateStructure) -> Self {
+        let has_future = !state.__buffa_unknown_fields.is_empty()
+            || state
+                .sender_chain_key
+                .as_option()
+                .is_some_and(|key| !key.__buffa_unknown_fields.is_empty())
+            || state
+                .sender_signing_key
+                .as_option()
+                .is_some_and(|key| !key.__buffa_unknown_fields.is_empty())
+            || state
+                .sender_message_keys
+                .iter()
+                .any(|key| !key.__buffa_unknown_fields.is_empty());
+        let future = has_future.then(|| std::sync::Arc::new(state.clone()));
+
         // Move the backlog out of the protobuf into the shared Arc and the
         // chain key out into the Copy field; the seeds were validated at
         // deserialize before this runs. The id and signing key stay as is.
@@ -368,8 +396,9 @@ impl SenderKeyState {
             Some(SenderChainKey::new(sc.iteration.unwrap_or_default(), seed))
         });
         Self {
+            future,
             sender_key_id: state.sender_key_id,
-            sender_signing_key: state.sender_signing_key.take().into(),
+            sender_signing_key: state.sender_signing_key.take().map(std::sync::Arc::new),
             message_keys,
             sender_chain,
             signing_key_memo: std::sync::OnceLock::new(),
@@ -391,6 +420,13 @@ impl SenderKeyState {
 
     pub fn set_sender_chain_key(&mut self, chain_key: SenderChainKey) {
         self.sender_chain = Some(chain_key);
+        if let Some(future) = self.future.as_mut() {
+            let state = std::sync::Arc::make_mut(future);
+            if let Some(chain) = state.sender_chain_key.as_option_mut() {
+                chain.iteration = Some(chain_key.iteration);
+                chain.seed = Some(bytes::Bytes::copy_from_slice(&chain_key.chain_key));
+            }
+        }
     }
 
     /// Advance the sender chain up to a reload's reserved iteration ceiling so no
@@ -422,7 +458,7 @@ impl SenderKeyState {
     }
 
     pub fn signing_key_public(&self) -> Result<PublicKey, InvalidSenderKeySessionError> {
-        if let Some(signing_key) = self.sender_signing_key.as_option() {
+        if let Some(signing_key) = self.sender_signing_key.as_deref() {
             let public = signing_key
                 .public
                 .as_ref()
@@ -522,7 +558,7 @@ impl SenderKeyState {
     fn signing_key_bytes(&self) -> Result<[u8; 32], InvalidSenderKeySessionError> {
         let signing_key = self
             .sender_signing_key
-            .as_option()
+            .as_deref()
             .ok_or(InvalidSenderKeySessionError("missing signing key"))?;
         let private = signing_key
             .private
@@ -537,7 +573,7 @@ impl SenderKeyState {
         if let Some(key) = self.signing_key_memo.get() {
             return Ok(key.clone());
         }
-        if let Some(signing_key) = self.sender_signing_key.as_option() {
+        if let Some(signing_key) = self.sender_signing_key.as_deref() {
             let private = signing_key
                 .private
                 .as_ref()
@@ -561,34 +597,112 @@ impl SenderKeyState {
         self.signing_key_memo.get().is_some()
     }
 
+    #[cold]
+    #[inline(never)]
+    fn preserved_protobuf(&self) -> Option<SenderKeyStateStructure> {
+        let mut state = (**self.future.as_ref()?).clone();
+        state.sender_key_id = self.sender_key_id;
+        state.sender_signing_key = self.sender_signing_key.as_deref().cloned().into();
+        state.sender_chain_key =
+            self.sender_chain
+                .as_ref()
+                .map_or_else(MessageField::none, |chain| {
+                    let mut key = state.sender_chain_key.take().unwrap_or_default();
+                    key.iteration = Some(chain.iteration);
+                    key.seed = Some(bytes::Bytes::copy_from_slice(&chain.chain_key));
+                    MessageField::some(key)
+                });
+        // Index once: a full skipped-key backlog must not make storage quadratic.
+        // Each occurrence owns its future fields, even when iteration and seed
+        // are identical. Consume matching occurrences in their original order.
+        let mut original: Vec<_> = std::mem::take(&mut state.sender_message_keys)
+            .into_iter()
+            .enumerate()
+            .map(|(index, key)| {
+                (
+                    key.iteration.unwrap_or_default(),
+                    key.seed.clone(),
+                    index,
+                    Some(key),
+                )
+            })
+            .collect();
+        original.sort_unstable_by(|a, b| (a.0, &a.1, a.2).cmp(&(b.0, &b.1, b.2)));
+        state.sender_message_keys = self
+            .message_keys
+            .iter()
+            .map(|key| {
+                let seed = bytes::Bytes::copy_from_slice(&key.seed);
+                let identity = (key.iteration, Some(key.seed.as_slice()));
+                // Consumed slots form a prefix inside each identity's run, so
+                // partition_point stays logarithmic even for all-equal keys.
+                let first = original.partition_point(|entry| {
+                    match (entry.0, entry.1.as_deref()).cmp(&identity) {
+                        std::cmp::Ordering::Less => true,
+                        std::cmp::Ordering::Equal => entry.3.is_none(),
+                        std::cmp::Ordering::Greater => false,
+                    }
+                });
+                let mut stored = original
+                    .get_mut(first)
+                    .filter(|entry| (entry.0, entry.1.as_deref()) == identity)
+                    .and_then(|entry| entry.3.take())
+                    .unwrap_or_default();
+                stored.iteration = Some(key.iteration);
+                stored.seed = Some(seed);
+                stored
+            })
+            .collect();
+        Some(state)
+    }
+
     #[cfg(test)]
     pub(crate) fn as_protobuf(&self) -> SenderKeyStateStructure {
-        SenderKeyStateStructure {
-            sender_key_id: self.sender_key_id,
-            sender_chain_key: self
+        if let Some(state) = self.preserved_protobuf() {
+            return state;
+        }
+        {
+            let mut proto_ = SenderKeyStateStructure::default();
+            proto_.sender_key_id = self.sender_key_id;
+            proto_.sender_chain_key = self
                 .sender_chain
                 .as_ref()
-                .map_or_else(MessageField::none, |c| MessageField::some(c.as_protobuf())),
-            sender_signing_key: self.sender_signing_key.clone(),
-            sender_message_keys: StoredMessageKey::as_protobuf_list(&self.message_keys),
+                .map_or_else(MessageField::none, |c| MessageField::some(c.as_protobuf()));
+            proto_.sender_signing_key = self.sender_signing_key.as_deref().cloned().into();
+            proto_.sender_message_keys = StoredMessageKey::as_protobuf_list(&self.message_keys);
+            proto_
         }
     }
 
     fn into_protobuf(self) -> SenderKeyStateStructure {
-        SenderKeyStateStructure {
-            sender_key_id: self.sender_key_id,
-            sender_chain_key: self
+        if let Some(state) = self.preserved_protobuf() {
+            return state;
+        }
+        {
+            let mut proto_ = SenderKeyStateStructure::default();
+            proto_.sender_key_id = self.sender_key_id;
+            proto_.sender_chain_key = self
                 .sender_chain
                 .as_ref()
                 .map_or_else(MessageField::none, |chain| {
                     MessageField::some(chain.as_protobuf())
-                }),
-            sender_signing_key: self.sender_signing_key,
-            sender_message_keys: StoredMessageKey::as_protobuf_list(&self.message_keys),
+                });
+            proto_.sender_signing_key = self
+                .sender_signing_key
+                .map(std::sync::Arc::unwrap_or_clone)
+                .into();
+            proto_.sender_message_keys = StoredMessageKey::as_protobuf_list(&self.message_keys);
+            proto_
         }
     }
 
+    #[allow(clippy::disallowed_methods)]
     fn encoded_len(&self) -> usize {
+        if self.future.is_some()
+            && let Some(state) = self.preserved_protobuf()
+        {
+            return state.encoded_len() as usize;
+        }
         use record_encoding::{bytes_len, nested_len, seed_record_len, uint32_len};
 
         self.sender_key_id.map_or(0, uint32_len)
@@ -596,7 +710,7 @@ impl SenderKeyState {
                 .sender_chain
                 .as_ref()
                 .map_or(0, |chain| nested_len(seed_record_len(chain.iteration)))
-            + self.sender_signing_key.as_option().map_or(0, |key| {
+            + self.sender_signing_key.as_deref().map_or(0, |key| {
                 nested_len(
                     key.public.as_deref().map_or(0, bytes_len)
                         + key.private.as_deref().map_or(0, bytes_len),
@@ -609,7 +723,14 @@ impl SenderKeyState {
                 .sum::<usize>()
     }
 
+    #[allow(clippy::disallowed_methods)]
     fn encode_into(&self, out: &mut Vec<u8>) {
+        if self.future.is_some()
+            && let Some(state) = self.preserved_protobuf()
+        {
+            state.encode(out);
+            return;
+        }
         use record_encoding::{
             bytes_len, write_bytes, write_nested, write_seed_record, write_uint32,
         };
@@ -621,7 +742,7 @@ impl SenderKeyState {
             write_nested(2, record_encoding::seed_record_len(chain.iteration), out);
             write_seed_record(chain.iteration, &chain.chain_key, out);
         }
-        if let Some(key) = self.sender_signing_key.as_option() {
+        if let Some(key) = self.sender_signing_key.as_deref() {
             let len = key.public.as_deref().map_or(0, bytes_len)
                 + key.private.as_deref().map_or(0, bytes_len);
             write_nested(3, len, out);
@@ -655,6 +776,45 @@ impl SenderKeyState {
         let len = keys.len();
         if len > consts::MAX_MESSAGE_KEYS + consts::MESSAGE_KEY_PRUNE_THRESHOLD {
             let excess = len - consts::MAX_MESSAGE_KEYS;
+            if let Some(future) = self.future.as_mut() {
+                // Count expired occurrences once. A set of survivors cannot
+                // distinguish identical keys carrying different future data.
+                let mut expired: Vec<_> = keys[..excess]
+                    .iter()
+                    .map(|key| ((key.iteration, key.seed), 1usize))
+                    .collect();
+                expired.sort_unstable_by_key(|entry| entry.0);
+                expired.dedup_by(|next, previous| {
+                    if next.0 != previous.0 {
+                        return false;
+                    }
+                    previous.1 += next.1;
+                    true
+                });
+                std::sync::Arc::make_mut(future)
+                    .sender_message_keys
+                    .retain(|old| {
+                        let Some(seed) = old
+                            .seed
+                            .as_deref()
+                            .and_then(|seed| <[u8; 32]>::try_from(seed).ok())
+                        else {
+                            return true;
+                        };
+                        let Ok(index) = expired.binary_search_by_key(
+                            &(old.iteration.unwrap_or_default(), seed),
+                            |entry| entry.0,
+                        ) else {
+                            return true;
+                        };
+                        let count = &mut expired[index].1;
+                        if *count == 0 {
+                            return true;
+                        }
+                        *count -= 1;
+                        false
+                    });
+            }
             keys.drain(..excess);
         }
     }
@@ -667,12 +827,22 @@ impl SenderKeyState {
             .iter()
             .position(|x| x.iteration == iteration)?;
         let smk = std::sync::Arc::make_mut(&mut self.message_keys).remove(index);
+        if let Some(future) = self.future.as_mut() {
+            let future = std::sync::Arc::make_mut(future);
+            if let Some(index) = future.sender_message_keys.iter().position(|old| {
+                old.iteration.unwrap_or_default() == smk.iteration
+                    && old.seed.as_deref() == Some(smk.seed.as_slice())
+            }) {
+                future.sender_message_keys.remove(index);
+            }
+        }
         Some(SenderMessageKey::new(smk.iteration, smk.seed))
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SenderKeyRecord {
+    future: buffa::UnknownFields,
     states: VecDeque<SenderKeyState>,
     /// Durability lease over sender-chain iterations, mirroring
     /// `SessionRecord`'s for DM, or the consumer's declaration that it needs
@@ -737,6 +907,15 @@ mod record_encoding {
     }
 }
 
+impl std::fmt::Debug for SenderKeyRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SenderKeyRecord")
+            .field("states", &self.states)
+            .field("lease", &self.lease)
+            .finish_non_exhaustive()
+    }
+}
+
 impl SenderKeyRecord {
     pub fn new_empty() -> Self {
         Self {
@@ -746,6 +925,7 @@ impl SenderKeyRecord {
             // allocation per sender learned — 255 of them on joining a large
             // group — that the first `group_decrypt` clone dropped anyway.
             states: VecDeque::new(),
+            future: buffa::UnknownFields::new(),
             lease: CounterLease::default(),
         }
     }
@@ -767,6 +947,7 @@ impl SenderKeyRecord {
 
         Ok(Self {
             states,
+            future: buffa::UnknownFields::new(),
             lease: CounterLease::default(),
         })
     }
@@ -887,6 +1068,7 @@ impl SenderKeyRecord {
 
         Ok(Self {
             states,
+            future: future_record_fields(skr.__buffa_unknown_fields),
             lease: CounterLease::from_persisted_ceiling(reserved_iteration),
         })
     }
@@ -1011,8 +1193,11 @@ impl SenderKeyRecord {
             states.push(state.as_protobuf());
         }
 
-        SenderKeyRecordStructure {
-            sender_key_states: states,
+        {
+            let mut proto = SenderKeyRecordStructure::default();
+            proto.sender_key_states = states;
+            proto.__buffa_unknown_fields = self.future.clone().into();
+            proto
         }
     }
 
@@ -1049,16 +1234,35 @@ impl SenderKeyRecord {
         // Retain lengths on the stack so sizing never rescans a backlog during
         // the write pass or adds a heap allocation per flush.
         let mut state_lengths = [0; consts::MAX_SENDER_KEY_STATES];
+        // A protobuf state is large even when absent. Keep its temporary slots
+        // off the ordinary flush path; only future-bearing records reconstruct
+        // them, once for both sizing and writing.
+        let preserved = if self.states.iter().any(|state| state.future.is_some()) {
+            self.preserved_states()
+        } else {
+            Vec::new()
+        };
         let mut states_len = 0;
         for (index, state) in self.states.iter().enumerate() {
-            let len = state.encoded_len();
+            let len = preserved
+                .get(index)
+                .and_then(Option::as_ref)
+                .map_or_else(|| state.encoded_len(), |pb| pb.encoded_len() as usize);
             state_lengths[index] = len;
             states_len += record_encoding::nested_len(len);
         }
-        let mut buf = Vec::with_capacity(states_len + reservation_len + incarnation_len);
+        let mut buf = Vec::with_capacity(
+            states_len + reservation_len + incarnation_len + self.future.encoded_len(),
+        );
         for (index, state) in self.states.iter().enumerate() {
             record_encoding::write_nested(1, state_lengths[index], &mut buf);
-            state.encode_into(&mut buf);
+            if let Some(pb) = preserved.get(index).and_then(Option::as_ref) {
+                // No codec wrapper exists for this nested storage message.
+                #[allow(clippy::disallowed_methods)]
+                pb.encode(&mut buf);
+            } else {
+                state.encode_into(&mut buf);
+            }
         }
         // Append the local-only reservation as a top-level field the generated
         // decoder skips. Emitted only when non-zero, so legacy/unreserved records
@@ -1070,7 +1274,17 @@ impl SenderKeyRecord {
         if let Some(incarnation) = incarnation {
             super::local_field::encode_store_incarnation(&mut buf, incarnation);
         }
+        self.future.write_to(&mut buf);
         Ok(buf)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn preserved_states(&self) -> Vec<Option<SenderKeyStateStructure>> {
+        self.states
+            .iter()
+            .map(|state| state.preserved_protobuf())
+            .collect()
     }
 
     /// Retained in-memory bytes of every state this record holds.
@@ -1093,12 +1307,18 @@ impl SenderKeyRecord {
     /// describe a constant.
     pub fn estimated_size(&self) -> usize {
         size_of::<Self>()
+            + unknown_fields_retained(&self.future)
             + self.states.capacity() * size_of::<SenderKeyState>()
             + self
                 .states
                 .iter()
                 .map(|s| {
-                    signing_key_pointed_bytes(&s.sender_signing_key)
+                    s.future.as_ref().map_or(0, |state| future_state_pointed_bytes(state))
+                        + s.sender_signing_key.as_deref().map_or(0, |key| {
+                            // Charge retained reachability per record, including the
+                            // Arc counters; this is not a unique-allocation census.
+                            2 * size_of::<usize>() + signing_key_pointed_bytes(Some(key))
+                        })
                         // The `Arc` owns a `Vec` header plus its buffer.
                         + size_of::<Vec<StoredMessageKey>>()
                         + s.message_keys.capacity() * size_of::<StoredMessageKey>()
@@ -1108,25 +1328,47 @@ impl SenderKeyRecord {
 }
 
 /// Heap bytes one sender-key state's signing key points at, excluding the
-/// `MessageField` slot itself — it lives inline in `SenderKeyState`.
+/// owner slot itself. The caller counts any Arc counters separately.
 ///
 /// The chain key and the skipped-key backlog are not walked here: this state
 /// keeps them in `SenderChainKey` and [`StoredMessageKey`] (36 bytes each,
 /// seeds inline) rather than in the protobuf's heap-allocated `Bytes`, and
 /// `estimated_size` counts them there.
 fn signing_key_pointed_bytes(
-    signing_key: &MessageField<sender_key_state_structure::SenderSigningKey>,
+    signing_key: Option<&sender_key_state_structure::SenderSigningKey>,
 ) -> usize {
     fn bytes_field(field: &Option<bytes::Bytes>) -> usize {
         field.as_ref().map_or(0, |b| b.len())
     }
 
-    // `MessageField` is an `Option<Box<T>>`, so a set one owns its `T`.
-    signing_key.as_option().map_or(0, |signing| {
+    signing_key.map_or(0, |signing| {
         size_of::<sender_key_state_structure::SenderSigningKey>()
             + bytes_field(&signing.public)
             + bytes_field(&signing.private)
+            + unknown_fields_retained(&signing.__buffa_unknown_fields)
     })
+}
+
+fn future_state_pointed_bytes(state: &SenderKeyStateStructure) -> usize {
+    2 * size_of::<usize>()
+        + size_of::<SenderKeyStateStructure>()
+        + unknown_fields_retained(&state.__buffa_unknown_fields)
+        + signing_key_pointed_bytes(state.sender_signing_key.as_option())
+        + state.sender_chain_key.as_option().map_or(0, |key| {
+            size_of::<sender_key_state_structure::SenderChainKey>()
+                + key.seed.as_ref().map_or(0, |v| v.len())
+                + unknown_fields_retained(&key.__buffa_unknown_fields)
+        })
+        + state.sender_message_keys.capacity()
+            * size_of::<sender_key_state_structure::SenderMessageKey>()
+        + state
+            .sender_message_keys
+            .iter()
+            .map(|key| {
+                key.seed.as_ref().map_or(0, |v| v.len())
+                    + unknown_fields_retained(&key.__buffa_unknown_fields)
+            })
+            .sum::<usize>()
 }
 
 #[cfg(test)]
@@ -1157,6 +1399,107 @@ mod tests {
     // module itself no longer encodes anything.
     use crate::protocol::KeyPair;
     use buffa::Message;
+
+    #[test]
+    fn shared_signing_key_survives_owner_drop_and_export_mutation() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<SenderKeyState>();
+        let mut signing = sender_key_state_structure::SenderSigningKey::default();
+        signing.private = Some(bytes::Bytes::from_static(&[7; 32]));
+        signing.__buffa_unknown_fields.push(buffa::UnknownField {
+            number: 200,
+            data: buffa::UnknownFieldData::Varint(23),
+        });
+        let mut proto = SenderKeyStateStructure::default();
+        proto.sender_signing_key = MessageField::some(signing);
+        let state = SenderKeyState::from_protobuf(proto);
+        let clone = state.clone();
+        assert!(std::sync::Arc::ptr_eq(
+            state
+                .sender_signing_key
+                .as_ref()
+                .expect("fixture signing key"),
+            clone
+                .sender_signing_key
+                .as_ref()
+                .expect("cloned signing key"),
+        ));
+        let expected = state.as_protobuf().encode_to_vec();
+        let mut exported = clone.into_protobuf();
+        let exported_key = exported
+            .sender_signing_key
+            .as_option_mut()
+            .expect("exported signing key");
+        exported_key.private = Some(bytes::Bytes::from_static(&[9; 32]));
+        exported_key.__buffa_unknown_fields.clear();
+        assert_eq!(state.as_protobuf().encode_to_vec(), expected);
+        let survivor = state.clone();
+        drop(state);
+        assert_eq!(
+            std::thread::spawn(move || survivor.into_protobuf().encode_to_vec())
+                .join()
+                .expect("export thread"),
+            expected
+        );
+    }
+
+    #[test]
+    fn shared_signing_key_releases_byte_owner_after_last_export() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        struct ByteOwner {
+            bytes: [u8; 32],
+            dropped: Arc<AtomicUsize>,
+        }
+        impl AsRef<[u8]> for ByteOwner {
+            fn as_ref(&self) -> &[u8] {
+                &self.bytes
+            }
+        }
+        impl Drop for ByteOwner {
+            fn drop(&mut self) {
+                self.dropped.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let mut signing = sender_key_state_structure::SenderSigningKey::default();
+        signing.private = Some(bytes::Bytes::from_owner(ByteOwner {
+            bytes: [7; 32],
+            dropped: Arc::clone(&dropped),
+        }));
+        let mut proto = SenderKeyStateStructure::default();
+        proto.sender_signing_key = MessageField::some(signing);
+        let state = SenderKeyState::from_protobuf(proto);
+        let weak = Arc::downgrade(
+            state
+                .sender_signing_key
+                .as_ref()
+                .expect("fixture signing key"),
+        );
+        let clone = state.clone();
+        let exported = state.into_protobuf();
+        assert_eq!(dropped.load(Ordering::SeqCst), 0);
+        drop(clone);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(dropped.load(Ordering::SeqCst), 0);
+        drop(exported);
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        drop(weak);
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn absent_and_unique_signing_keys_keep_their_persisted_shape() {
+        let absent = SenderKeyState::from_protobuf(SenderKeyStateStructure::default());
+        assert!(absent.clone().into_protobuf().sender_signing_key.is_unset());
+        let mut proto = SenderKeyStateStructure::default();
+        proto.sender_signing_key = MessageField::some(Default::default());
+        let expected = proto.encode_to_vec();
+        let state = SenderKeyState::from_protobuf(proto);
+        assert_eq!(state.into_protobuf().encode_to_vec(), expected);
+    }
 
     /// An injected derivation has to be indistinguishable from the one the
     /// state would have produced, or the API trades correctness for speed.
@@ -1710,9 +2053,8 @@ mod tests {
         }
     }
 
-    /// The slim state keeps only the id and the signing message. Dropping the
-    /// always-empty protobuf `Vec` (three words) and `MessageField` (one word)
-    /// saves exactly those four words off the inline struct on every target.
+    /// The compact state drops the unused protobuf Vec and MessageField.
+    /// Future data uses a separate one-word handle, charged explicitly below.
     #[test]
     fn sender_key_state_layout_dropped_the_protobuf_copies() {
         // Width-independent: narrower pointers on 32-bit targets shrink the
@@ -1725,30 +2067,39 @@ mod tests {
         // Budget, not contract: the total floats with the protobuf runtime
         // layout, so only growth fails. Rebaseline per
         // [layout asserts](../../../../agent_docs/testing.md).
+        // Preserving future wire fields adds one UnknownFields container to
+        // the generated structure (24 bytes on 64-bit, 12 on 32-bit). Keep
+        // that explicit so this allowance cannot hide other layout growth.
+        let unknown_fields = size_of::<buffa::UnknownFields>();
+        let future_handle = size_of::<Option<std::sync::Arc<SenderKeyStateStructure>>>();
         #[cfg(target_pointer_width = "64")]
         {
             assert!(
-                size_of::<SenderKeyState>() <= 224,
-                "SenderKeyState grew to {} B (budget 224)",
-                size_of::<SenderKeyState>()
+                size_of::<SenderKeyState>() <= 224 + future_handle,
+                "SenderKeyState grew to {} B (budget {})",
+                size_of::<SenderKeyState>(),
+                224 + future_handle
             );
             assert!(
-                size_of::<SenderKeyStateStructure>() <= 48,
-                "SenderKeyStateStructure grew to {} B (budget 48)",
-                size_of::<SenderKeyStateStructure>()
+                size_of::<SenderKeyStateStructure>() <= 48 + unknown_fields,
+                "SenderKeyStateStructure grew to {} B (budget {})",
+                size_of::<SenderKeyStateStructure>(),
+                48 + unknown_fields
             );
         }
         #[cfg(target_pointer_width = "32")]
         {
             assert!(
-                size_of::<SenderKeyState>() <= 204,
-                "SenderKeyState grew to {} B (budget 204)",
-                size_of::<SenderKeyState>()
+                size_of::<SenderKeyState>() <= 204 + future_handle,
+                "SenderKeyState grew to {} B (budget {})",
+                size_of::<SenderKeyState>(),
+                204 + future_handle
             );
             assert!(
-                size_of::<SenderKeyStateStructure>() <= 28,
-                "SenderKeyStateStructure grew to {} B (budget 28)",
-                size_of::<SenderKeyStateStructure>()
+                size_of::<SenderKeyStateStructure>() <= 28 + unknown_fields,
+                "SenderKeyStateStructure grew to {} B (budget {})",
+                size_of::<SenderKeyStateStructure>(),
+                28 + unknown_fields
             );
         }
     }
@@ -1765,26 +2116,35 @@ mod tests {
             chain: bool,
             signing_public: Option<&[u8]>,
         ) -> SenderKeyStateStructure {
-            SenderKeyStateStructure {
-                sender_key_id: id,
-                sender_chain_key: if chain {
-                    MessageField::some(sender_key_state_structure::SenderChainKey {
-                        iteration: Some(4),
-                        seed: Some(Bytes::copy_from_slice(&[0x11; 32])),
+            {
+                let mut proto = SenderKeyStateStructure::default();
+                proto.sender_key_id = id;
+                proto.sender_chain_key = if chain {
+                    MessageField::some({
+                        let mut proto = sender_key_state_structure::SenderChainKey::default();
+                        proto.iteration = Some(4);
+                        proto.seed = Some(Bytes::copy_from_slice(&[0x11; 32]));
+                        proto
                     })
                 } else {
                     MessageField::none()
-                },
-                sender_signing_key: signing_public.map_or_else(MessageField::none, |public| {
-                    MessageField::some(sender_key_state_structure::SenderSigningKey {
-                        public: Some(Bytes::copy_from_slice(public)),
-                        private: None,
-                    })
-                }),
-                sender_message_keys: vec![sender_key_state_structure::SenderMessageKey {
-                    iteration: Some(2),
-                    seed: Some(Bytes::copy_from_slice(&[0x33; 32])),
-                }],
+                };
+                proto.sender_signing_key =
+                    signing_public.map_or_else(MessageField::none, |public| {
+                        MessageField::some({
+                            let mut proto = sender_key_state_structure::SenderSigningKey::default();
+                            proto.public = Some(Bytes::copy_from_slice(public));
+                            proto.private = None;
+                            proto
+                        })
+                    });
+                proto.sender_message_keys = vec![{
+                    let mut proto = sender_key_state_structure::SenderMessageKey::default();
+                    proto.iteration = Some(2);
+                    proto.seed = Some(Bytes::copy_from_slice(&[0x33; 32]));
+                    proto
+                }];
+                proto
             }
         }
 
@@ -1814,8 +2174,10 @@ mod tests {
                 "id={id:?} chain={chain} signing={signing}"
             );
 
-            let record_bytes = SenderKeyRecordStructure {
-                sender_key_states: vec![state_with(id, chain, public)],
+            let record_bytes = {
+                let mut proto = SenderKeyRecordStructure::default();
+                proto.sender_key_states = vec![state_with(id, chain, public)];
+                proto
             }
             .encode_to_vec();
             let record =
@@ -1837,38 +2199,53 @@ mod tests {
         let signing_keys = [
             MessageField::none(),
             MessageField::some(sender_key_state_structure::SenderSigningKey::default()),
-            MessageField::some(sender_key_state_structure::SenderSigningKey {
-                public: Some(Bytes::new()),
-                private: Some(Bytes::new()),
+            MessageField::some({
+                let mut proto = sender_key_state_structure::SenderSigningKey::default();
+                proto.public = Some(Bytes::new());
+                proto.private = Some(Bytes::new());
+                proto
             }),
-            MessageField::some(sender_key_state_structure::SenderSigningKey {
-                public: Some(Bytes::from(vec![0x11; 33])),
-                private: Some(Bytes::from(vec![0x22; 32])),
+            MessageField::some({
+                let mut proto = sender_key_state_structure::SenderSigningKey::default();
+                proto.public = Some(Bytes::from(vec![0x11; 33]));
+                proto.private = Some(Bytes::from(vec![0x22; 32]));
+                proto
             }),
-            MessageField::some(sender_key_state_structure::SenderSigningKey {
-                public: Some(Bytes::from(vec![0x33; 128])),
-                private: None,
+            MessageField::some({
+                let mut proto = sender_key_state_structure::SenderSigningKey::default();
+                proto.public = Some(Bytes::from(vec![0x33; 128]));
+                proto.private = None;
+                proto
             }),
         ];
         for id in std::iter::once(None).chain(boundaries.map(Some)) {
             for signing in &signing_keys {
                 for chain in [None, Some(0), Some(u32::MAX)] {
                     for count in [0, 1, 8, 256, consts::MAX_MESSAGE_KEYS] {
-                        let state = SenderKeyState::from_protobuf(SenderKeyStateStructure {
-                            sender_key_id: id,
-                            sender_chain_key: chain.map_or_else(MessageField::none, |iteration| {
-                                MessageField::some(sender_key_state_structure::SenderChainKey {
-                                    iteration: Some(iteration),
-                                    seed: Some(Bytes::from(vec![0x44; 32])),
+                        let state = SenderKeyState::from_protobuf({
+                            let mut proto = SenderKeyStateStructure::default();
+                            proto.sender_key_id = id;
+                            proto.sender_chain_key =
+                                chain.map_or_else(MessageField::none, |iteration| {
+                                    MessageField::some({
+                                        let mut proto =
+                                            sender_key_state_structure::SenderChainKey::default();
+                                        proto.iteration = Some(iteration);
+                                        proto.seed = Some(Bytes::from(vec![0x44; 32]));
+                                        proto
+                                    })
+                                });
+                            proto.sender_signing_key = signing.clone();
+                            proto.sender_message_keys = (0..count)
+                                .map(|i| {
+                                    let mut proto =
+                                        sender_key_state_structure::SenderMessageKey::default();
+                                    proto.iteration = Some(boundaries[i % boundaries.len()]);
+                                    proto.seed = Some(Bytes::from(vec![0x55; 32]));
+                                    proto
                                 })
-                            }),
-                            sender_signing_key: signing.clone(),
-                            sender_message_keys: (0..count)
-                                .map(|i| sender_key_state_structure::SenderMessageKey {
-                                    iteration: Some(boundaries[i % boundaries.len()]),
-                                    seed: Some(Bytes::from(vec![0x55; 32])),
-                                })
-                                .collect(),
+                                .collect();
+                            proto
                         });
                         let mut record = SenderKeyRecord::new_empty();
                         // Exercise multiple states and a shared backlog without
@@ -1980,6 +2357,295 @@ mod tests {
             .sender_key_state()
             .expect("sender key state should exist");
         assert_eq!(state.chain_id(), 12345);
+    }
+
+    #[test]
+    fn sender_key_future_fields_follow_full_backlog_after_removal() {
+        let mut record = record_with_state(42, 0x55);
+        let state = record.sender_key_state_mut().expect("fixture state");
+        for iteration in 0..consts::MAX_MESSAGE_KEYS as u32 {
+            state.add_skipped_message_key(iteration, [0x66; 32]);
+        }
+        let mut pb = record.as_protobuf();
+        for key in &mut pb.sender_key_states[0].sender_message_keys {
+            key.__buffa_unknown_fields.push(buffa::UnknownField {
+                number: 200,
+                data: buffa::UnknownFieldData::Varint(
+                    key.iteration.expect("fixture iteration") as u64
+                ),
+            });
+        }
+        let wire = pb.encode_to_vec();
+        let mut loaded = SenderKeyRecord::deserialize(&wire).expect("fixture decode");
+        assert_eq!(loaded.serialize().expect("fixture encode"), wire);
+        loaded
+            .sender_key_state_mut()
+            .expect("fixture state")
+            .remove_sender_message_key(17)
+            .expect("retained skipped key");
+        pb.sender_key_states[0]
+            .sender_message_keys
+            .retain(|key| key.iteration != Some(17));
+        assert_eq!(
+            loaded.serialize().expect("fixture encode"),
+            pb.encode_to_vec()
+        );
+    }
+
+    #[test]
+    fn duplicate_skipped_keys_keep_each_occurrences_future_fields() {
+        let mut record = record_with_state(42, 0x55);
+        let state = record.sender_key_state_mut().expect("fixture state");
+        state.add_skipped_message_key(7, [0x66; 32]);
+        state.add_skipped_message_key(7, [0x66; 32]);
+        let mut expected = record.as_protobuf();
+        for (index, key) in expected.sender_key_states[0]
+            .sender_message_keys
+            .iter_mut()
+            .enumerate()
+        {
+            key.__buffa_unknown_fields.push(buffa::UnknownField {
+                number: 200,
+                data: buffa::UnknownFieldData::Varint(index as u64 + 1),
+            });
+        }
+        let original = expected.encode_to_vec();
+        let mut loaded = SenderKeyRecord::deserialize(&original).expect("fixture decode");
+        let untouched = loaded.clone();
+        assert_eq!(loaded.serialize().expect("fixture encode"), original);
+
+        loaded
+            .sender_key_state_mut()
+            .expect("fixture state")
+            .remove_sender_message_key(7)
+            .expect("first occurrence");
+        expected.sender_key_states[0].sender_message_keys.remove(0);
+        assert_eq!(
+            loaded.serialize().expect("fixture encode"),
+            expected.encode_to_vec()
+        );
+
+        loaded
+            .sender_key_state_mut()
+            .expect("fixture state")
+            .add_skipped_message_key(7, [0x66; 32]);
+        let mut fresh = expected.sender_key_states[0].sender_message_keys[0].clone();
+        fresh.__buffa_unknown_fields.clear();
+        expected.sender_key_states[0]
+            .sender_message_keys
+            .push(fresh);
+        loaded
+            .sender_key_state_mut()
+            .expect("fixture state")
+            .remove_sender_message_key(7)
+            .expect("second occurrence");
+        expected.sender_key_states[0].sender_message_keys.remove(0);
+        assert_eq!(
+            loaded.serialize().expect("fixture encode"),
+            expected.encode_to_vec()
+        );
+        assert_eq!(untouched.serialize().expect("fixture encode"), original);
+    }
+
+    #[test]
+    fn pruning_duplicate_skipped_keys_expires_only_prefix_occurrences() {
+        let mut record = record_with_state(42, 0x55);
+        let count = consts::MAX_MESSAGE_KEYS + consts::MESSAGE_KEY_PRUNE_THRESHOLD;
+        let state = record.sender_key_state_mut().expect("fixture state");
+        for index in 0..count {
+            state.add_skipped_message_key(index as u32, [0x66; 32]);
+        }
+        let mut expected = record.as_protobuf();
+        let keys = &mut expected.sender_key_states[0].sender_message_keys;
+        for key in keys
+            .iter_mut()
+            .take(consts::MESSAGE_KEY_PRUNE_THRESHOLD + 1)
+        {
+            key.iteration = Some(0);
+        }
+        keys[100].iteration = keys[0].iteration;
+        for (index, value) in [(0, 11), (100, 22)] {
+            keys[index]
+                .__buffa_unknown_fields
+                .push(buffa::UnknownField {
+                    number: 200,
+                    data: buffa::UnknownFieldData::Varint(value),
+                });
+        }
+        let mut fresh = keys[1].clone();
+        fresh.iteration = Some(count as u32);
+        let mut loaded =
+            SenderKeyRecord::deserialize(&expected.encode_to_vec()).expect("fixture decode");
+        loaded
+            .sender_key_state_mut()
+            .expect("fixture state")
+            .add_skipped_message_key(count as u32, [0x66; 32]);
+        let keys = &mut expected.sender_key_states[0].sender_message_keys;
+        keys.push(fresh);
+        keys.drain(..keys.len() - consts::MAX_MESSAGE_KEYS);
+        assert_eq!(
+            loaded.serialize().expect("fixture encode"),
+            expected.encode_to_vec()
+        );
+        assert_eq!(
+            loaded
+                .sender_key_state()
+                .expect("fixture state")
+                .message_keys
+                .len(),
+            consts::MAX_MESSAGE_KEYS
+        );
+    }
+
+    #[test]
+    fn all_equal_future_backlog_keeps_occurrence_order() {
+        let mut record = record_with_state(42, 0x55);
+        let state = record.sender_key_state_mut().expect("fixture state");
+        for _ in 0..consts::MAX_MESSAGE_KEYS {
+            state.add_skipped_message_key(7, [0x66; 32]);
+        }
+        let mut expected = record.as_protobuf();
+        for (index, key) in expected.sender_key_states[0]
+            .sender_message_keys
+            .iter_mut()
+            .enumerate()
+        {
+            key.__buffa_unknown_fields.push(buffa::UnknownField {
+                number: 200,
+                data: buffa::UnknownFieldData::Varint(index as u64),
+            });
+        }
+        let original = expected.encode_to_vec();
+        let mut loaded = SenderKeyRecord::deserialize(&original).expect("fixture decode");
+        assert_eq!(loaded.serialize().expect("fixture encode"), original);
+        loaded
+            .sender_key_state_mut()
+            .expect("fixture state")
+            .remove_sender_message_key(7)
+            .expect("first occurrence");
+        expected.sender_key_states[0].sender_message_keys.remove(0);
+        assert_eq!(
+            loaded.serialize().expect("fixture encode"),
+            expected.encode_to_vec()
+        );
+    }
+
+    #[test]
+    fn sender_key_future_fields_survive_storage_and_chain_updates() {
+        let mut record = record_with_state(42, 0x55);
+        record
+            .sender_key_state_mut()
+            .expect("valid synthetic sender-key fixture")
+            .add_skipped_message_key(7, [0x66; 32]);
+        let mut pb = record.as_protobuf();
+        let future = buffa::UnknownField {
+            number: 200,
+            data: buffa::UnknownFieldData::LengthDelimited(vec![0x77; 8192]),
+        };
+        pb.__buffa_unknown_fields.push(future.clone());
+        let state = &mut pb.sender_key_states[0];
+        state.__buffa_unknown_fields.push(future.clone());
+        state
+            .sender_chain_key
+            .as_option_mut()
+            .expect("valid synthetic sender-key fixture")
+            .__buffa_unknown_fields
+            .push(future.clone());
+        state
+            .sender_signing_key
+            .as_option_mut()
+            .expect("valid synthetic sender-key fixture")
+            .__buffa_unknown_fields
+            .push(future.clone());
+        state.sender_message_keys[0]
+            .__buffa_unknown_fields
+            .push(future.clone());
+        let wire = pb.encode_to_vec();
+        let mut loaded =
+            SenderKeyRecord::deserialize(&wire).expect("valid synthetic sender-key fixture");
+        assert_eq!(
+            loaded
+                .serialize()
+                .expect("valid synthetic sender-key fixture"),
+            wire
+        );
+        assert!(loaded.estimated_size() >= 5 * 8192);
+        assert!(!format!("{loaded:?}").contains("LengthDelimited"));
+        loaded.reserve_iterations(0);
+        let stored = loaded
+            .serialize_for_store(&[0x33; 16])
+            .expect("valid synthetic sender-key fixture");
+        loaded = SenderKeyRecord::deserialize_for_store(&stored, &[0x33; 16])
+            .expect("valid synthetic sender-key fixture");
+        assert_eq!(
+            loaded
+                .serialize_for_store(&[0x33; 16])
+                .expect("valid synthetic sender-key fixture"),
+            stored
+        );
+
+        let state = loaded
+            .sender_key_state_mut()
+            .expect("valid synthetic sender-key fixture");
+        state.set_sender_chain_key(
+            state
+                .sender_chain_key()
+                .expect("valid synthetic sender-key fixture")
+                .next()
+                .expect("valid synthetic sender-key fixture"),
+        );
+        let restored = waproto::codec::sender_key_record_decode(
+            &loaded
+                .serialize()
+                .expect("valid synthetic sender-key fixture"),
+        )
+        .expect("valid synthetic sender-key fixture");
+        assert_eq!(
+            future_record_fields(restored.__buffa_unknown_fields),
+            pb.__buffa_unknown_fields
+        );
+        let restored = &restored.sender_key_states[0];
+        assert_eq!(
+            restored.__buffa_unknown_fields,
+            pb.sender_key_states[0].__buffa_unknown_fields
+        );
+        assert_eq!(
+            restored.sender_chain_key.__buffa_unknown_fields,
+            pb.sender_key_states[0]
+                .sender_chain_key
+                .__buffa_unknown_fields
+        );
+        assert_eq!(
+            restored.sender_message_keys[0].__buffa_unknown_fields,
+            pb.sender_key_states[0].sender_message_keys[0].__buffa_unknown_fields
+        );
+        loaded
+            .sender_key_state_mut()
+            .expect("valid synthetic sender-key fixture")
+            .remove_sender_message_key(7)
+            .expect("valid synthetic sender-key fixture");
+        let state = loaded
+            .sender_key_state()
+            .expect("valid synthetic sender-key fixture");
+        assert!(
+            state
+                .future
+                .as_ref()
+                .expect("valid synthetic sender-key fixture")
+                .sender_message_keys
+                .is_empty()
+        );
+        assert!(
+            waproto::codec::sender_key_record_decode(
+                &loaded
+                    .serialize()
+                    .expect("valid synthetic sender-key fixture")
+            )
+            .expect("valid synthetic sender-key fixture")
+            .sender_key_states[0]
+                .sender_message_keys
+                .is_empty()
+        );
     }
 
     fn record_with_state(chain_id: u32, seed: u8) -> SenderKeyRecord {
@@ -2179,8 +2845,10 @@ mod tests {
     fn test_sender_key_record_deserialize_bounds_state_history() {
         let mut state = record_with_state(12345, 0x42).as_protobuf();
         let state = state.sender_key_states.pop().expect("test state");
-        let encoded = SenderKeyRecordStructure {
-            sender_key_states: vec![state; consts::MAX_SENDER_KEY_STATES + 1],
+        let encoded = {
+            let mut proto = SenderKeyRecordStructure::default();
+            proto.sender_key_states = vec![state; consts::MAX_SENDER_KEY_STATES + 1];
+            proto
         }
         .encode_to_vec();
 
@@ -2269,15 +2937,20 @@ mod tests {
 
     #[test]
     fn test_sender_key_record_deserialize_rejects_invalid_chain_seed() {
-        let record = SenderKeyRecordStructure {
-            sender_key_states: vec![SenderKeyStateStructure {
-                sender_key_id: Some(12345),
-                sender_chain_key: MessageField::some(sender_key_state_structure::SenderChainKey {
-                    iteration: Some(0),
-                    seed: Some(bytes::Bytes::copy_from_slice(&[0x42; 31])),
-                }),
-                ..Default::default()
-            }],
+        let record = {
+            let mut proto = SenderKeyRecordStructure::default();
+            proto.sender_key_states = vec![{
+                let mut proto = SenderKeyStateStructure::default();
+                proto.sender_key_id = Some(12345);
+                proto.sender_chain_key = MessageField::some({
+                    let mut proto = sender_key_state_structure::SenderChainKey::default();
+                    proto.iteration = Some(0);
+                    proto.seed = Some(bytes::Bytes::copy_from_slice(&[0x42; 31]));
+                    proto
+                });
+                proto
+            }];
+            proto
         };
 
         let err = SenderKeyRecord::deserialize(&record.encode_to_vec())
@@ -2288,19 +2961,26 @@ mod tests {
 
     #[test]
     fn test_sender_key_record_deserialize_rejects_invalid_message_seed() {
-        let record = SenderKeyRecordStructure {
-            sender_key_states: vec![SenderKeyStateStructure {
-                sender_key_id: Some(12345),
-                sender_chain_key: MessageField::some(sender_key_state_structure::SenderChainKey {
-                    iteration: Some(0),
-                    seed: Some(bytes::Bytes::copy_from_slice(&[0x42; 32])),
-                }),
-                sender_message_keys: vec![sender_key_state_structure::SenderMessageKey {
-                    iteration: Some(1),
-                    seed: Some(bytes::Bytes::copy_from_slice(&[0x43; 31])),
-                }],
-                ..Default::default()
-            }],
+        let record = {
+            let mut proto = SenderKeyRecordStructure::default();
+            proto.sender_key_states = vec![{
+                let mut proto = SenderKeyStateStructure::default();
+                proto.sender_key_id = Some(12345);
+                proto.sender_chain_key = MessageField::some({
+                    let mut proto = sender_key_state_structure::SenderChainKey::default();
+                    proto.iteration = Some(0);
+                    proto.seed = Some(bytes::Bytes::copy_from_slice(&[0x42; 32]));
+                    proto
+                });
+                proto.sender_message_keys = vec![{
+                    let mut proto = sender_key_state_structure::SenderMessageKey::default();
+                    proto.iteration = Some(1);
+                    proto.seed = Some(bytes::Bytes::copy_from_slice(&[0x43; 31]));
+                    proto
+                }];
+                proto
+            }];
+            proto
         };
 
         let err = SenderKeyRecord::deserialize(&record.encode_to_vec())
