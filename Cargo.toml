@@ -421,6 +421,12 @@ required-features = ["bench-harness", "sqlite-storage"]
 name = "connected_idle_lifecycle"
 required-features = ["bench-harness"]
 
+# The CI feature suite and registered event-fixtures consumer run this target.
+# Keep its dispatcher fixture out of ordinary production example builds.
+[[test]]
+name = "event_delivery_public"
+required-features = ["bench-harness"]
+
 [[example]]
 name = "connected_idle"
 test = true

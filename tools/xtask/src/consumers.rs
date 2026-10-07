@@ -799,6 +799,28 @@ mod tests {
         assert!(validate(root.path(), &consumers).is_err());
     }
     #[test]
+    fn named_tests_are_explicit_and_target_selectors_are_exclusive() {
+        let (root, mut consumers) = fixture();
+        consumers[0].commands[0].test = Some("event_delivery".into());
+        assert!(validate(root.path(), &consumers).is_ok());
+        let args = consumers[0].commands[0].args(&consumers[0], Lane::Native);
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--test", "event_delivery"])
+        );
+        consumers[0].commands[0].lib = true;
+        assert!(validate(root.path(), &consumers).is_err());
+        consumers[0].commands[0].lib = false;
+        consumers[0].commands[0].bin = Some("probe".into());
+        assert!(validate(root.path(), &consumers).is_err());
+        assert!(
+            serde_json::from_str::<Invocation>(
+                r#"{"lanes":["native"],"mode":"test","test":"event_delivery","unknown":true}"#
+            )
+            .is_err()
+        );
+    }
+    #[test]
     fn refuses_wasm_test_run_and_missing_locks() {
         let (root, mut consumers) = fixture();
         consumers[0].commands[0].lanes = vec![Lane::Native, Lane::Wasm];
