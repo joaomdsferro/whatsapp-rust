@@ -362,6 +362,7 @@ jobs:
           exclude-allocations: false
           working-directory: _a02_pair/base
           run: |
+            set -e
             "$GITHUB_WORKSPACE/_a02_tools/target/debug/whatsapp-xtask" ci codspeed-pair capture --side base
             cargo codspeed run -p wacore --bench appstate_sync_benchmark bench_collect_unique_index_macs_duplicates
             cargo codspeed run -p wacore --bench sender_key_derivation_benchmark store_round_trip_rebuilt
@@ -380,6 +381,7 @@ jobs:
           exclude-allocations: false
           working-directory: _a02_pair/head
           run: |
+            set -e
             "$GITHUB_WORKSPACE/_a02_tools/target/debug/whatsapp-xtask" ci codspeed-pair capture --side head
             cargo codspeed run -p wacore --bench appstate_sync_benchmark bench_collect_unique_index_macs_duplicates
             cargo codspeed run -p wacore --bench sender_key_derivation_benchmark store_round_trip_rebuilt
@@ -401,3 +403,28 @@ jobs:
             _a02_profiles/preflight/*
           if-no-files-found: error
           include-hidden-files: true
+
+  a02-cpu-pair-revalidate:
+    if: github.event_name == 'pull_request' && github.event.action == 'synchronize' && github.event.before == 'a5e0f2f661cb89d7f6719d7015b49ae8c6f8d026' && github.event.pull_request.number == 1694 && github.head_ref == 'experiment/a02-shared-signing'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-06-16
+      - name: Retrieve the preserved pair without repeating measurements
+        uses: actions/download-artifact@v8
+        with:
+          name: a02-cpu-pair-37625866250
+          run-id: 37625866250
+          github-token: ${{ github.token }}
+          path: _a02_profiles
+      - name: Validate the original measurements
+        run: cargo xt ci codspeed-pair validate

@@ -1,7 +1,7 @@
 //! Contracts for the fixed, upload-disabled A02 benchmark comparison.
 use anyhow::{Context, Result, ensure};
 use clap::{Subcommand, ValueEnum};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -134,6 +134,42 @@ fn equal(left: &Path, right: &Path, name: &str) -> Result<()> {
     );
     Ok(())
 }
+fn preflight_contracts(preflight: &Path, measured: &Path) -> Result<()> {
+    for name in CONTRACTS {
+        if *name != "build-env.txt" {
+            equal(preflight, measured, name)?;
+        }
+    }
+    type Environment = BTreeMap<String, Option<String>>;
+    let mut expected: Environment =
+        serde_json::from_slice(&std::fs::read(preflight.join("build-env.txt"))?)?;
+    let actual: Environment =
+        serde_json::from_slice(&std::fs::read(measured.join("build-env.txt"))?)?;
+    // The pinned Valgrind Debian wrapper adds its debug directory; traced
+    // execs prepend vgpreload_core. Retain every other pre-build setting.
+    for name in ["LD_PRELOAD", "LD_LIBRARY_PATH"] {
+        let original = expected
+            .get(name)
+            .context("missing loader environment contract")?
+            .as_deref()
+            .map(serde_json::from_str::<String>)
+            .transpose()?
+            .unwrap_or_default();
+        let value = match name {
+            "LD_PRELOAD" => {
+                format!("/usr/libexec/valgrind/vgpreload_core-amd64-linux.so:{original}")
+            }
+            _ if original.is_empty() => "/usr/lib/debug".to_owned(),
+            _ => format!("{original}:/usr/lib/debug"),
+        };
+        expected.insert(name.to_owned(), Some(format!("{value:?}")));
+    }
+    ensure!(
+        expected == actual,
+        "measurement environment differs from the pinned runner contract"
+    );
+    Ok(())
+}
 fn profile(directory: &Path) -> Result<PathBuf> {
     let profiles: Vec<_> = std::fs::read_dir(directory)?
         .filter_map(|entry| entry.ok())
@@ -171,7 +207,7 @@ fn measured(profile: &Path) -> Result<Vec<String>> {
             "missing measured benchmark: {required}"
         );
     }
-    let mut has_events = false;
+    let mut instrumented = BTreeSet::new();
     for entry in std::fs::read_dir(profile)? {
         let path = entry?.path();
         if !path.is_file()
@@ -183,18 +219,39 @@ fn measured(profile: &Path) -> Result<Vec<String>> {
             continue;
         }
         let text = std::fs::read_to_string(path)?;
-        has_events |= text.lines().any(|line| {
-            line.strip_prefix("events: ")
-                .is_some_and(|fields| !fields.trim().is_empty())
-        }) && text.lines().any(|line| {
-            line.strip_prefix("summary:").is_some_and(|values| {
-                values
+        for part in text.split("part:").skip(1) {
+            let name = part
+                .lines()
+                .find_map(|line| line.strip_prefix("desc: Trigger: Client Request: "));
+            let events = part.lines().find_map(|line| line.strip_prefix("events: "));
+            // Client-request dumps can have a zero header summary. Closing
+            // totals contain the costs actually dumped for this benchmark.
+            let totals = part.lines().find_map(|line| line.strip_prefix("totals:"));
+            if let (Some(name), Some(events), Some(totals)) = (name, events, totals) {
+                let costs: Vec<u64> = totals
                     .split_whitespace()
-                    .any(|value| value.parse::<u64>().is_ok_and(|value| value > 0))
-            })
-        });
+                    .map(str::parse)
+                    .collect::<std::result::Result<_, _>>()?;
+                let fields: Vec<_> = events.split_whitespace().collect();
+                // Callgrind omits trailing zero costs.
+                ensure!(
+                    !costs.is_empty() && costs.len() <= fields.len(),
+                    "profile event columns differ"
+                );
+                if fields
+                    .iter()
+                    .zip(costs)
+                    .any(|(field, cost)| *field == "Ir" && cost > 0)
+                {
+                    instrumented.insert(name.to_owned());
+                }
+            }
+        }
     }
-    ensure!(has_events, "no nonempty instrumented profile");
+    ensure!(
+        names.iter().all(|name| instrumented.contains(name)),
+        "missing nonempty instrumented benchmark profile"
+    );
     Ok(names)
 }
 fn validate(root: &Path) -> Result<()> {
@@ -204,6 +261,12 @@ fn validate(root: &Path) -> Result<()> {
         ensure!(
             std::fs::read_to_string(path.join("source-commit.txt"))?.trim() == sha,
             "unexpected measured source"
+        );
+        preflight_contracts(&root.join("preflight"), path)?;
+        ensure!(
+            std::fs::read_to_string(path.join("runner-version.txt"))?.trim()
+                == "codspeed-runner 5.4.0",
+            "unexpected CodSpeed runner version"
         );
     }
     let base_names = measured(&base)?;
@@ -287,9 +350,7 @@ pub fn run(task: Task) -> Result<()> {
                 destination.join("cpuinfo.txt"),
                 std::fs::read("/proc/cpuinfo")?,
             )?;
-            for name in CONTRACTS {
-                equal(&profiles.join("preflight"), &destination, name)?;
-            }
+            preflight_contracts(&profiles.join("preflight"), &destination)?;
             if matches!(side, Side::Head) {
                 equal(
                     &profile(&profiles.join("base"))?,
@@ -322,10 +383,38 @@ mod tests {
         result.status = std::process::ExitStatus::from_raw(127 << 8);
         assert!(version(&result).is_err());
     }
+    fn nonempty_profile() -> String {
+        REQUIRED.iter().map(|name| format!(
+            "part: 1\ndesc: Trigger: Client Request: {name}\nevents: Ir Dr\nsummary: 0\ntotals: 12\n"
+        )).collect()
+    }
     #[test]
     fn pair_rejects_changed_contracts_missing_measurements_and_empty_profiles() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
+        let preflight = root.join("preflight");
+        std::fs::create_dir(&preflight).unwrap();
+        let env = BTreeMap::from([
+            ("LD_PRELOAD", None),
+            ("LD_LIBRARY_PATH", None),
+            ("CARGO_INCREMENTAL", Some("\"0\"")),
+        ]);
+        for name in CONTRACTS {
+            write(preflight.join(name), "same").unwrap();
+        }
+        write(
+            preflight.join("build-env.txt"),
+            serde_json::to_vec(&env).unwrap(),
+        )
+        .unwrap();
+        let runtime_env = BTreeMap::from([
+            (
+                "LD_PRELOAD",
+                Some("\"/usr/libexec/valgrind/vgpreload_core-amd64-linux.so:\""),
+            ),
+            ("LD_LIBRARY_PATH", Some("\"/usr/lib/debug\"")),
+            ("CARGO_INCREMENTAL", Some("\"0\"")),
+        ]);
         for (side, sha) in [("base", BASE), ("head", HEAD)] {
             let path = root.join(side).join("profile.1.out");
             std::fs::create_dir_all(&path).unwrap();
@@ -333,6 +422,12 @@ mod tests {
             for name in CONTRACTS.iter().copied().chain(["runner-version.txt"]) {
                 write(path.join(name), "same").unwrap();
             }
+            write(path.join("runner-version.txt"), "codspeed-runner 5.4.0\n").unwrap();
+            write(
+                path.join("build-env.txt"),
+                serde_json::to_vec(&runtime_env).unwrap(),
+            )
+            .unwrap();
             write(
                 path.join("runner.log"),
                 REQUIRED
@@ -341,16 +436,52 @@ mod tests {
                     .collect::<String>(),
             )
             .unwrap();
-            write(path.join("1.out"), "events: Ir\nsummary: 12\n").unwrap();
+            write(path.join("1.out"), nonempty_profile()).unwrap();
         }
         assert!(validate(root).is_ok());
         let head = root.join("head/profile.1.out");
+        let mut changed = runtime_env.clone();
+        changed.insert("LD_PRELOAD", Some("\"/tmp/other.so\""));
+        write(
+            head.join("build-env.txt"),
+            serde_json::to_vec(&changed).unwrap(),
+        )
+        .unwrap();
+        assert!(validate(root).is_err());
+        changed = runtime_env.clone();
+        changed.insert("CARGO_INCREMENTAL", Some("\"1\""));
+        write(
+            head.join("build-env.txt"),
+            serde_json::to_vec(&changed).unwrap(),
+        )
+        .unwrap();
+        assert!(validate(root).is_err());
+        write(
+            head.join("build-env.txt"),
+            serde_json::to_vec(&runtime_env).unwrap(),
+        )
+        .unwrap();
+        write(head.join("runner-version.txt"), "codspeed-runner 5.3.0").unwrap();
+        assert!(validate(root).is_err());
+        write(head.join("runner-version.txt"), "codspeed-runner 5.4.0").unwrap();
         write(head.join("runtime.sha256"), "different").unwrap();
         assert!(validate(root).is_err());
         write(head.join("runtime.sha256"), "same").unwrap();
-        write(head.join("1.out"), "events: Ir\nsummary: 0\n").unwrap();
+        write(
+            head.join("1.out"),
+            nonempty_profile()
+                .replace("summary: 0", "summary: 12")
+                .replace("totals: 12", "totals: 0"),
+        )
+        .unwrap();
         assert!(validate(root).is_err());
-        write(head.join("1.out"), "events: Ir\nsummary: 12\n").unwrap();
+        write(
+            head.join("1.out"),
+            nonempty_profile().replacen("totals: 12", "totals: 0", 1),
+        )
+        .unwrap();
+        assert!(validate(root).is_err());
+        write(head.join("1.out"), nonempty_profile()).unwrap();
         write(head.join("runner.log"), "Measured: unrelated\n").unwrap();
         assert!(validate(root).is_err());
         std::fs::create_dir(root.join("base/profile.2.out")).unwrap();
