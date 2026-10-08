@@ -3595,11 +3595,23 @@ impl Client {
             target: "Client/AppState",
             "Falling back to the server's {name} snapshot without its aggregate MAC"
         );
-        wacore::appstate::tolerate_snapshot_mac_mismatch(name);
         let client = self.clone();
+        let name = name.to_string();
         self.runtime.spawn_detached(Box::pin(async move {
-            if let Err(e) = client.resync_app_state_collection(patch).await {
-                warn!(target: "Client/AppState", "Fallback resync of {patch:?} failed: {e}");
+            client
+                .get_app_state_processor()
+                .tolerate_next_snapshot_mac_mismatch(&name)
+                .await;
+            match client.resync_app_state_collection(patch).await {
+                Ok(report) if report.all_synced() => {}
+                Ok(report) => warn!(
+                    target: "Client/AppState",
+                    "Fallback resync of {patch:?} left {:?} unsynced",
+                    report.unsynced().collect::<Vec<_>>()
+                ),
+                Err(e) => {
+                    warn!(target: "Client/AppState", "Fallback resync of {patch:?} failed: {e}")
+                }
             }
         }));
     }

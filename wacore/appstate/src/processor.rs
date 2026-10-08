@@ -228,34 +228,6 @@ pub struct PatchProcessingResult {
     pub removed_index_macs: Vec<Vec<u8>>,
 }
 
-/// Collections whose snapshot MAC is allowed to disagree with the ltHash
-/// folded here, because the primary could not be asked to rebuild them.
-static TOLERATED_SNAPSHOT_MISMATCH: std::sync::Mutex<Vec<String>> =
-    std::sync::Mutex::new(Vec::new());
-
-/// Lets the next snapshot of `collection_name` through a MAC mismatch.
-///
-/// The last resort once peer recovery has failed: without it the collection
-/// stays at version 0 for good. Every record is still decoded with its own
-/// index and value MACs checked, so what gets through is a snapshot whose
-/// records are each authentic and whose aggregate the server disagrees with.
-pub fn tolerate_snapshot_mac_mismatch(collection_name: &str) {
-    let mut tolerated = TOLERATED_SNAPSHOT_MISMATCH
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    if !tolerated.iter().any(|n| n == collection_name) {
-        tolerated.push(collection_name.to_string());
-    }
-}
-
-fn snapshot_mismatch_tolerated(collection_name: &str) -> bool {
-    TOLERATED_SNAPSHOT_MISMATCH
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .iter()
-        .any(|n| n == collection_name)
-}
-
 /// Process a snapshot and decode all its records.
 ///
 /// This is a pure, synchronous function that processes a snapshot without
@@ -273,9 +245,38 @@ fn snapshot_mismatch_tolerated(collection_name: &str) -> bool {
 pub fn process_snapshot<F>(
     snapshot: &wa::SyncdSnapshot,
     initial_state: &mut HashState,
+    get_keys: F,
+    validate_macs: bool,
+    collection_name: &str,
+) -> Result<ProcessedSnapshot, AppStateError>
+where
+    F: FnMut(&[u8]) -> Result<Arc<ExpandedAppStateKeys>, AppStateError>,
+{
+    process_snapshot_tolerating(
+        snapshot,
+        initial_state,
+        get_keys,
+        validate_macs,
+        collection_name,
+        false,
+    )
+}
+
+/// [`process_snapshot`], optionally letting the snapshot through a MAC mismatch.
+///
+/// The last resort once peer recovery has failed: without it the collection
+/// stays at version 0 for good. Every record is still decoded with its own
+/// index and value MACs checked, so what gets through is a snapshot whose
+/// records are each authentic and whose aggregate the server disagrees with.
+/// The aggregate is the only check against records left out, so the caller
+/// grants this for one snapshot of one collection, never as a standing rule.
+pub fn process_snapshot_tolerating<F>(
+    snapshot: &wa::SyncdSnapshot,
+    initial_state: &mut HashState,
     mut get_keys: F,
     validate_macs: bool,
     collection_name: &str,
+    tolerate_mac_mismatch: bool,
 ) -> Result<ProcessedSnapshot, AppStateError>
 where
     F: FnMut(&[u8]) -> Result<Arc<ExpandedAppStateKeys>, AppStateError>,
@@ -415,7 +416,7 @@ where
                 fold.unkeyed,
                 key_probe
             );
-            if !snapshot_mismatch_tolerated(collection_name) {
+            if !tolerate_mac_mismatch {
                 return Err(AppStateError::SnapshotMACMismatch);
             }
             warn!(
@@ -1262,16 +1263,21 @@ mod tests {
             }),
         };
         let get_keys = |_: &[u8]| Ok(Arc::new(keys.clone()));
-        // A name of its own: the tolerance is process-wide.
-        let name = "tolerated_test_collection";
+        let name = "regular_low";
 
         let err = process_snapshot(&snapshot, &mut HashState::default(), get_keys, true, name)
             .expect_err("an untolerated mismatch must still fail");
         assert!(matches!(err, AppStateError::SnapshotMACMismatch));
 
-        tolerate_snapshot_mac_mismatch(name);
-        let result = process_snapshot(&snapshot, &mut HashState::default(), get_keys, true, name)
-            .expect("a tolerated mismatch applies");
+        let result = process_snapshot_tolerating(
+            &snapshot,
+            &mut HashState::default(),
+            get_keys,
+            true,
+            name,
+            true,
+        )
+        .expect("a tolerated mismatch applies");
         assert_eq!(result.mutations.len(), 1);
     }
 

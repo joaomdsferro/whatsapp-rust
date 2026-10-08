@@ -2109,7 +2109,7 @@ mod tests {
 /// bytes.
 fn inflate_zlib(payload: &[u8]) -> Result<Vec<u8>, String> {
     let mut reader = wacore_binary::zlib_pool::InflateReader::new(
-        &payload,
+        payload,
         wacore::history_sync::MAX_DECOMPRESSED,
     );
     let mut plain = Vec::new();
@@ -2153,7 +2153,7 @@ fn inflate_zlib(payload: &[u8]) -> Result<Vec<u8>, String> {
 }
 
 /// The primary's reply flagged compressed but not as zlib: try gzip, then raw
-/// deflate. Bounded like the zlib path.
+/// deflate. Bounded like the zlib path, and whole or nothing like it too.
 fn inflate_other(payload: &[u8]) -> Option<Vec<u8>> {
     use std::io::Read;
     let max = wacore::history_sync::MAX_DECOMPRESSED;
@@ -2162,15 +2162,79 @@ fn inflate_other(payload: &[u8]) -> Option<Vec<u8>> {
         reader.take(max + 1).read_to_end(&mut plain).ok()?;
         (!plain.is_empty() && plain.len() as u64 <= max).then_some(plain)
     };
-    let (format, plain) = read(&mut flate2::read::GzDecoder::new(payload))
+    // A gzip reader stops after its first member and a raw deflate one after
+    // its final block, so a stream that ends before the payload does would hand
+    // a parseable prefix over as the whole collection. The decoders read from
+    // the slice itself, and what they leave of it has to be nothing.
+    let gzip = || {
+        let mut decoder = flate2::bufread::GzDecoder::new(payload);
+        let plain = read(&mut decoder)?;
+        decoder.into_inner().is_empty().then_some(plain)
+    };
+    let deflate = || {
+        let mut decoder = flate2::bufread::DeflateDecoder::new(payload);
+        let plain = read(&mut decoder)?;
+        decoder.into_inner().is_empty().then_some(plain)
+    };
+    let (format, plain) = gzip()
         .map(|plain| ("gzip", plain))
-        .or_else(|| {
-            read(&mut flate2::read::DeflateDecoder::new(payload))
-                .map(|plain| ("raw deflate", plain))
-        })?;
+        .or_else(|| deflate().map(|plain| ("raw deflate", plain)))?;
     info!(
         "Snapshot recovery payload is {format}, not zlib (header {:02x?})",
         &payload[..payload.len().min(4)]
     );
     Some(plain)
+}
+
+#[cfg(test)]
+mod inflate_other_tests {
+    use super::inflate_other;
+    use std::io::Write;
+
+    fn gzip(data: &[u8]) -> Vec<u8> {
+        let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        e.write_all(data).unwrap();
+        e.finish().unwrap()
+    }
+
+    fn deflate(data: &[u8]) -> Vec<u8> {
+        let mut e = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+        e.write_all(data).unwrap();
+        e.finish().unwrap()
+    }
+
+    #[test]
+    fn inflates_a_whole_gzip_or_raw_deflate_stream() {
+        assert_eq!(
+            inflate_other(&gzip(b"records")).as_deref(),
+            Some(&b"records"[..])
+        );
+        assert_eq!(
+            inflate_other(&deflate(b"records")).as_deref(),
+            Some(&b"records"[..])
+        );
+    }
+
+    #[test]
+    fn refuses_a_second_gzip_member() {
+        let mut payload = gzip(b"first half");
+        payload.extend(gzip(b"second half"));
+        assert_eq!(inflate_other(&payload), None);
+    }
+
+    #[test]
+    fn refuses_bytes_after_a_raw_deflate_stream() {
+        let mut payload = deflate(b"records");
+        payload.push(0);
+        assert_eq!(inflate_other(&payload), None);
+    }
+
+    #[test]
+    fn refuses_a_truncated_stream() {
+        let data: Vec<u8> = (0..4096u32).flat_map(|i| i.to_le_bytes()).collect();
+        let payload = gzip(&data);
+        assert_eq!(inflate_other(&payload[..payload.len() - 4]), None);
+        let payload = deflate(&data);
+        assert_eq!(inflate_other(&payload[..payload.len() / 2]), None);
+    }
 }
