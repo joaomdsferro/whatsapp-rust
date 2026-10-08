@@ -101,12 +101,27 @@ impl<'a> MediaReupload<'a> {
         // Encrypt the ServerErrorReceipt
         let (ciphertext, iv) = encrypt_media_retry_receipt(req.media_key, req.msg_id)?;
 
-        // Get own JID for the receipt's `to` attribute
-        let device_snapshot = self.client.persistence_manager.get_device_snapshot();
-        let own_jid = device_snapshot
-            .pn
+        // The receipt goes to our own LID, as WAWebSendServerErrorReceiptJob
+        // sends it; the primary does not answer one addressed to our PN.
+        let own_jid = self
+            .client
+            .persistence_manager
+            .get_device_snapshot()
+            .lid
             .as_ref()
-            .ok_or(MediaReuploadError::NotLoggedIn)?;
+            .ok_or(MediaReuploadError::NotLoggedIn)?
+            .to_non_ad();
+        // A migrated account names a regular chat by its LID. A missing mapping
+        // keeps the original JID.
+        let chat = if req.chat_jid.is_pn() && self.client.is_lid_migrated().await {
+            match self.client.get_lid_pn_entry(req.chat_jid).await {
+                Ok(Some(entry)) => Jid::lid(entry.lid.as_ref()),
+                _ => req.chat_jid.to_non_ad(),
+            }
+        } else {
+            req.chat_jid.to_non_ad()
+        };
+        let participant = req.participant.map(Jid::to_non_ad);
 
         // Register waiter BEFORE sending (to avoid race)
         let waiter = self.client.wait_for_node(
@@ -117,11 +132,11 @@ impl<'a> MediaReupload<'a> {
 
         // Build and send the receipt node
         let receipt_node = build_media_retry_receipt(
-            own_jid,
+            &own_jid,
             req.msg_id,
-            req.chat_jid,
+            &chat,
             req.is_from_me,
-            req.participant,
+            participant.as_ref(),
             &ciphertext,
             &iv,
         );
