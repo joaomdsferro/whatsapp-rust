@@ -3574,9 +3574,7 @@ impl Client {
                     target: "Client/AppState",
                     "Failed to apply the snapshot recovery for {name}: {e}"
                 );
-                if let Some(client) = self.self_weak.get().and_then(|w| w.upgrade()) {
-                    client.fall_back_to_unverified_snapshot(name);
-                }
+                self.fall_back_to_unverified_snapshot(name, generation);
             }
         }
     }
@@ -3584,18 +3582,31 @@ impl Client {
     /// Peer recovery failed for a collection whose snapshot does not validate:
     /// take the server's snapshot after all, with each record still checked on
     /// its own, rather than leave the collection empty for good.
-    pub(crate) fn fall_back_to_unverified_snapshot(self: &Arc<Self>, name: &str) {
+    ///
+    /// `generation` is the connection the failed recovery belongs to. An answer
+    /// that outlived its connection is not allowed to waive the aggregate MAC
+    /// on the one that replaced it.
+    pub(crate) fn fall_back_to_unverified_snapshot(&self, name: &str, generation: u64) {
         let Ok(patch) = name.parse::<WAPatchName>() else {
             return;
         };
         if patch == WAPatchName::CriticalBlock {
             return;
         }
+        if self.connection_generation.load(Ordering::Acquire) != generation {
+            debug!(
+                target: "Client/AppState",
+                "Not falling back for {name}: the connection its recovery belongs to is gone"
+            );
+            return;
+        }
+        let Some(client) = self.self_weak.get().and_then(|w| w.upgrade()) else {
+            return;
+        };
         warn!(
             target: "Client/AppState",
             "Falling back to the server's {name} snapshot without its aggregate MAC"
         );
-        let client = self.clone();
         let name = name.to_string();
         self.runtime.spawn_detached(Box::pin(async move {
             client

@@ -543,13 +543,21 @@ impl Client {
             // end, or a usable recovery is dropped and the collection stays
             // behind the MAC failure it started at.
             let proc = self.get_app_state_processor();
-            if let Some(name) = proc.claim_recovery_request_by_id(request_id).await {
-                proc.take_recovery_request_by_id(request_id).await;
-                warn!(
-                    "Snapshot recovery response for {name} carries no result; it may be asked for again"
-                );
+            if proc
+                .claim_recovery_request_by_id(request_id)
+                .await
+                .is_some()
+                && let Some(name) = proc.take_recovery_request_by_id(request_id).await
+            {
+                warn!("Snapshot recovery response for {name} carries no result");
+                self.fall_back_to_unverified_snapshot(&name, self.current_generation());
             }
         }
+    }
+
+    fn current_generation(&self) -> u64 {
+        self.connection_generation
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Apply a collection the primary sent back after a snapshot we refused.
@@ -581,16 +589,20 @@ impl Client {
             // one's decoder is still working against -- and that task, finding
             // no marker at the end, would drop a usable recovery.
             let proc = self.get_app_state_processor();
-            let Some(name) = proc.claim_recovery_request_by_id(request_id).await else {
+            if proc
+                .claim_recovery_request_by_id(request_id)
+                .await
+                .is_none()
+            {
                 warn!(
                     "Ignoring a snapshot recovery with no collection: nothing here is waiting on that ask"
                 );
                 return;
-            };
-            proc.take_recovery_request_by_id(request_id).await;
-            warn!(
-                "Snapshot recovery response for {name} carries no collection; it may be asked for again"
-            );
+            }
+            if let Some(name) = proc.take_recovery_request_by_id(request_id).await {
+                warn!("Snapshot recovery response for {name} carries no collection");
+                self.fall_back_to_unverified_snapshot(&name, self.current_generation());
+            }
             return;
         };
 
@@ -651,13 +663,17 @@ impl Client {
             wacore::history_sync::MAX_DECOMPRESSED
         };
         if blob.len() as u64 > max_wire {
-            self.get_app_state_processor()
+            let taken = self
+                .get_app_state_processor()
                 .take_recovery_request_by_id(request_id)
                 .await;
             warn!(
                 "Snapshot recovery for {asked} is {} bytes on the wire, over the {max_wire} this path allows; refusing it",
                 blob.len()
             );
+            if taken.is_some() {
+                self.fall_back_to_unverified_snapshot(&asked, self.current_generation());
+            }
             return;
         }
         let payload = blob.to_vec();
@@ -703,7 +719,7 @@ impl Client {
                     match proc.take_recovery_request_by_id(&request_id).await {
                         Some(name) => {
                             warn!("Snapshot recovery response for {name} {e}");
-                            client.fall_back_to_unverified_snapshot(&name);
+                            client.fall_back_to_unverified_snapshot(&name, generation);
                         }
                         None => warn!("Snapshot recovery response {e}"),
                     }
