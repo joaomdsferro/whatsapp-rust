@@ -402,7 +402,10 @@ impl Client {
         let request_id = self.generate_message_id();
 
         let proc = self.get_app_state_processor();
-        if !proc.mark_recovery_requested(collection).await {
+        if !proc
+            .mark_recovery_requested(collection, self.current_generation())
+            .await
+        {
             // One is already outstanding, and the reply that is coming answers
             // this ask too. Suppressing the duplicate is also what keeps the
             // marker honest: a second send that failed would otherwise withdraw
@@ -547,10 +550,12 @@ impl Client {
                 .claim_recovery_request_by_id(request_id)
                 .await
                 .is_some()
-                && let Some(name) = proc.take_recovery_request_by_id(request_id).await
+                && let Some((name, asked_on)) = proc
+                    .take_recovery_request_with_generation_by_id(request_id)
+                    .await
             {
                 warn!("Snapshot recovery response for {name} carries no result");
-                self.fall_back_to_unverified_snapshot(&name, self.current_generation());
+                self.fall_back_to_unverified_snapshot(&name, asked_on);
             }
         }
     }
@@ -599,9 +604,12 @@ impl Client {
                 );
                 return;
             }
-            if let Some(name) = proc.take_recovery_request_by_id(request_id).await {
+            if let Some((name, asked_on)) = proc
+                .take_recovery_request_with_generation_by_id(request_id)
+                .await
+            {
                 warn!("Snapshot recovery response for {name} carries no collection");
-                self.fall_back_to_unverified_snapshot(&name, self.current_generation());
+                self.fall_back_to_unverified_snapshot(&name, asked_on);
             }
             return;
         };
@@ -665,14 +673,14 @@ impl Client {
         if blob.len() as u64 > max_wire {
             let taken = self
                 .get_app_state_processor()
-                .take_recovery_request_by_id(request_id)
+                .take_recovery_request_with_generation_by_id(request_id)
                 .await;
             warn!(
                 "Snapshot recovery for {asked} is {} bytes on the wire, over the {max_wire} this path allows; refusing it",
                 blob.len()
             );
-            if taken.is_some() {
-                self.fall_back_to_unverified_snapshot(&asked, self.current_generation());
+            if let Some((_, asked_on)) = taken {
+                self.fall_back_to_unverified_snapshot(&asked, asked_on);
             }
             return;
         }
@@ -716,10 +724,13 @@ impl Client {
                     // -- and leaving the marker would suppress every retry for
                     // the rest of the window over a question already answered.
                     let proc = client.get_app_state_processor();
-                    match proc.take_recovery_request_by_id(&request_id).await {
-                        Some(name) => {
+                    match proc
+                        .take_recovery_request_with_generation_by_id(&request_id)
+                        .await
+                    {
+                        Some((name, asked_on)) => {
                             warn!("Snapshot recovery response for {name} {e}");
-                            client.fall_back_to_unverified_snapshot(&name, generation);
+                            client.fall_back_to_unverified_snapshot(&name, asked_on);
                         }
                         None => warn!("Snapshot recovery response {e}"),
                     }

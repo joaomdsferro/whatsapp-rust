@@ -3470,13 +3470,16 @@ impl Client {
         // expired and been replaced. Taking by name would consume the
         // replacement's marker, apply the older reply, and have the newer one
         // refused as unsolicited.
-        if proc.take_recovery_request_by_id(request_id).await.is_none() {
+        let Some((_, asked_on)) = proc
+            .take_recovery_request_with_generation_by_id(request_id)
+            .await
+        else {
             debug!(
                 target: "Client/AppState",
                 "The recovery request for {name} is no longer outstanding; dropping this reply"
             );
             return;
-        }
+        };
 
         // Rechecked after the waits above, not only before them. A disconnect
         // during the key share or the reservation clears the registry, so the
@@ -3574,7 +3577,7 @@ impl Client {
                     target: "Client/AppState",
                     "Failed to apply the snapshot recovery for {name}: {e}"
                 );
-                self.fall_back_to_unverified_snapshot(name, generation);
+                self.fall_back_to_unverified_snapshot(name, asked_on);
             }
         }
     }
@@ -3583,9 +3586,9 @@ impl Client {
     /// take the server's snapshot after all, with each record still checked on
     /// its own, rather than leave the collection empty for good.
     ///
-    /// `generation` is the connection the failed recovery belongs to. An answer
-    /// that outlived its connection is not allowed to waive the aggregate MAC
-    /// on the one that replaced it.
+    /// `generation` is the connection the failed recovery was asked on, as
+    /// recorded with its marker. An answer that outlived that connection is not
+    /// allowed to waive the aggregate MAC on the one that replaced it.
     pub(crate) fn fall_back_to_unverified_snapshot(&self, name: &str, generation: u64) {
         let Ok(patch) = name.parse::<WAPatchName>() else {
             return;
