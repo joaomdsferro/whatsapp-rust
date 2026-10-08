@@ -3602,7 +3602,12 @@ impl Client {
                 .get_app_state_processor()
                 .tolerate_next_snapshot_mac_mismatch(&name)
                 .await;
-            match client.resync_app_state_collection(patch).await {
+            let result = client.resync_app_state_collection(patch).await;
+            client
+                .get_app_state_processor()
+                .revoke_snapshot_mac_tolerance(&name)
+                .await;
+            match result {
                 Ok(report) if report.all_synced() => {}
                 Ok(report) => warn!(
                     target: "Client/AppState",

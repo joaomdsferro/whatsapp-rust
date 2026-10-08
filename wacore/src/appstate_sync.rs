@@ -330,6 +330,16 @@ impl AppStateProcessor {
             .insert(collection.to_string());
     }
 
+    /// Withdraws a grant from [`Self::tolerate_next_snapshot_mac_mismatch`]
+    /// that no snapshot spent.
+    ///
+    /// For when the attempt it was granted for ends without processing one --
+    /// a refused or stale snapshot, a failed request -- so a snapshot fetched
+    /// later, for some other reason, does not inherit it.
+    pub async fn revoke_snapshot_mac_tolerance(&self, collection: &str) {
+        self.snapshot_mac_tolerated.lock().await.remove(collection);
+    }
+
     /// How many recovery requests are outstanding, for the memory report.
     pub async fn outstanding_recovery_requests(&self) -> usize {
         self.recovery_requested.lock().await.len()
