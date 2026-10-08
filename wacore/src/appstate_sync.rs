@@ -271,6 +271,10 @@ struct RecoveryRequest {
     /// Set once an answer carrying this id has been taken up, so a repeat of
     /// that answer is refused before it costs a decode.
     answering: bool,
+    /// The caller's connection generation when the ask was made. Opaque here;
+    /// it lets an answer that outlived that connection be told apart from one
+    /// that did not, since the marker itself survives a reconnect.
+    generation: u64,
 }
 
 /// What became of a collection the primary sent back.
@@ -443,7 +447,7 @@ impl AppStateProcessor {
     ///
     /// `false` means one is already outstanding and the caller should not send:
     /// the reply that is already coming answers this ask too.
-    pub async fn mark_recovery_requested(&self, collection: &str) -> bool {
+    pub async fn mark_recovery_requested(&self, collection: &str, generation: u64) -> bool {
         let mut outstanding = self.recovery_requested.lock().await;
         if let Some(request) = outstanding.get(collection)
             && request.asked_at.elapsed()
@@ -461,6 +465,7 @@ impl AppStateProcessor {
                 asked_at: crate::time::Instant::now(),
                 request_id: None,
                 answering: false,
+                generation,
             },
         );
         true
@@ -538,13 +543,24 @@ impl AppStateProcessor {
     /// marker would suppress every retry for the rest of the window over an ask
     /// that has already been answered -- badly, but answered.
     pub async fn take_recovery_request_by_id(&self, request_id: &str) -> Option<String> {
+        self.take_recovery_request_with_generation_by_id(request_id)
+            .await
+            .map(|(collection, _)| collection)
+    }
+
+    /// [`Self::take_recovery_request_by_id`], also returning the generation the
+    /// ask was marked with.
+    pub async fn take_recovery_request_with_generation_by_id(
+        &self,
+        request_id: &str,
+    ) -> Option<(String, u64)> {
         let mut outstanding = self.recovery_requested.lock().await;
         let collection = outstanding
             .iter()
             .find(|(_, request)| request.request_id.as_deref() == Some(request_id))
             .map(|(name, _)| name.clone())?;
-        outstanding.remove(&collection);
-        Some(collection)
+        let request = outstanding.remove(&collection)?;
+        Some((collection, request.generation))
     }
 
     /// Whether a recovery for this collection is outstanding, without taking it.
