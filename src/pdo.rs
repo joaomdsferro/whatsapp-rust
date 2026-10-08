@@ -1134,11 +1134,16 @@ impl Client {
             match recovery.collection_name.as_deref() {
                 Some(named) if named == asked => {}
                 other => {
-                    proc.take_recovery_request_by_id(&request_id).await;
+                    let taken = proc
+                        .take_recovery_request_with_generation_by_id(&request_id)
+                        .await;
                     warn!(
                         "Snapshot recovery answering the ask for {asked} names {}; refusing it",
                         other.unwrap_or("nothing")
                     );
+                    if let Some((_, asked_on)) = taken {
+                        client.fall_back_to_unverified_snapshot(&asked, asked_on);
+                    }
                     return;
                 }
             }

@@ -3389,14 +3389,20 @@ impl Client {
             .get_int(wacore::iq::abprops::web::SNAPSHOT_RECOVERY_MAX_MUTATIONS_COUNT_ALLOWED)
             .await;
         if allowed > 0 && recovery.mutation_records.len() as i64 > allowed {
-            self.get_app_state_processor()
-                .take_recovery_request_by_id(request_id)
+            let taken = self
+                .get_app_state_processor()
+                .take_recovery_request_with_generation_by_id(request_id)
                 .await;
             warn!(
                 target: "Client/AppState",
                 "Snapshot recovery for {name} carries {} records, over the {allowed} allowed; refusing it",
                 recovery.mutation_records.len()
             );
+            // Refused, so as unusable as one that would not decode: the
+            // snapshot still fails its MAC and no second answer is coming.
+            if let Some((_, asked_on)) = taken {
+                self.fall_back_to_unverified_snapshot(name, asked_on);
+            }
             return;
         }
 
@@ -3622,15 +3628,24 @@ impl Client {
         );
         let name = name.to_string();
         self.runtime.spawn_detached(Box::pin(async move {
-            client
-                .get_app_state_processor()
-                .tolerate_next_snapshot_mac_mismatch(&name)
-                .await;
+            // Asked again inside the task: the check above is true only until
+            // the task runs, and the grant is an await of its own.
+            let current = || client.connection_generation.load(Ordering::Acquire) == generation;
+            let proc = client.get_app_state_processor();
+            if !current() {
+                return;
+            }
+            proc.tolerate_next_snapshot_mac_mismatch(&name).await;
+            if !current() {
+                proc.revoke_snapshot_mac_tolerance(&name).await;
+                debug!(
+                    target: "Client/AppState",
+                    "Not falling back for {name}: the connection its recovery belongs to is gone"
+                );
+                return;
+            }
             let result = client.resync_app_state_collection(patch).await;
-            client
-                .get_app_state_processor()
-                .revoke_snapshot_mac_tolerance(&name)
-                .await;
+            proc.revoke_snapshot_mac_tolerance(&name).await;
             match result {
                 Ok(report) if report.all_synced() => {}
                 Ok(report) => warn!(
